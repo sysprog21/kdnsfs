@@ -91,6 +91,18 @@ static struct inode *dnsfs_make_inode(struct super_block *sb,
 static struct proc_dir_entry *dnsfs_proc_dir;
 atomic64_t dnsfs_wire_queries = ATOMIC64_INIT(0);
 
+/* Counts how often a record file re-renders its page cache. Repeated small
+ * reads of one open file must not bump this once the cache is fresh, which is
+ * the whole point of the read_iter fast path; the test asserts on the delta.
+ */
+static atomic64_t dnsfs_record_refreshes = ATOMIC64_INIT(0);
+
+struct dnsfs_record_file {
+    char fqdn[DNSFS_MAX_NAME + 1];
+    unsigned long cached_gen; /* cache generation this inode's pages reflect */
+    u16 qtype;
+};
+
 static ssize_t dnsfs_proc_wire_queries_read(struct file *file,
                                             char __user *buf,
                                             size_t len,
@@ -109,6 +121,25 @@ static const struct proc_ops dnsfs_proc_wire_queries_ops = {
 };
 
 static bool dnsfs_proc_wire_queries;
+
+static ssize_t dnsfs_proc_record_refreshes_read(struct file *file,
+                                                char __user *buf,
+                                                size_t len,
+                                                loff_t *ppos)
+{
+    char text[32];
+    int text_len;
+
+    text_len = scnprintf(text, sizeof(text), "%lld\n",
+                         atomic64_read(&dnsfs_record_refreshes));
+    return simple_read_from_buffer(buf, len, ppos, text, text_len);
+}
+
+static const struct proc_ops dnsfs_proc_record_refreshes_ops = {
+    .proc_read = dnsfs_proc_record_refreshes_read,
+};
+
+static bool dnsfs_proc_record_refreshes;
 
 static bool dnsfs_is_lower_label(const struct qstr *name)
 {
@@ -991,18 +1022,25 @@ static struct inode *dnsfs_new_inode(struct super_block *sb, umode_t mode)
 static int dnsfs_record_fill(struct file *file, char *line)
 {
     struct dentry *dentry = file_dentry(file);
-    struct dentry *parent = dget_parent(dentry);
     struct dnsfs_config *cfg = dentry->d_sb->s_fs_info;
+    struct dnsfs_record_file *record = file->private_data;
     char fqdn[DNSFS_MAX_NAME + 1];
     u16 qtype;
     int ret;
 
-    ret = dnsfs_path_to_fqdn(parent, fqdn, sizeof(fqdn));
-    dput(parent);
-    if (ret)
-        return ret;
+    if (record) {
+        qtype = record->qtype;
+        strscpy(fqdn, record->fqdn, sizeof(fqdn));
+    } else {
+        struct dentry *parent = dget_parent(dentry);
 
-    qtype = dnsfs_qtype(&dentry->d_name);
+        ret = dnsfs_path_to_fqdn(parent, fqdn, sizeof(fqdn));
+        dput(parent);
+        if (ret)
+            return ret;
+        qtype = dnsfs_qtype(&dentry->d_name);
+    }
+
     if (cfg->sock && qtype)
         return dnsfs_query_record(cfg, fqdn, qtype, line, DNSFS_RECORD_TEXT_MAX,
                                   dentry->d_inode->i_mapping);
@@ -1012,16 +1050,31 @@ static int dnsfs_record_fill(struct file *file, char *line)
 
 static int dnsfs_record_refresh(struct inode *inode, struct file *file)
 {
+    struct dnsfs_record_file *record = file->private_data;
     char *line;
     int ret;
 
     line = kmalloc(DNSFS_RECORD_TEXT_MAX, GFP_KERNEL);
     if (!line)
         return -ENOMEM;
+    atomic64_inc(&dnsfs_record_refreshes);
     ret = dnsfs_record_fill(file, line);
     if (ret >= 0) {
         i_size_write(inode, ret);
         invalidate_mapping_pages(inode->i_mapping, 0, -1);
+        /* Stamp the generation these freshly-filled pages now reflect, so a
+         * later read can skip the refresh only while the cache hasn't moved.
+         */
+        if (record) {
+            struct dnsfs_config *cfg = inode->i_sb->s_fs_info;
+
+            /* WRITE_ONCE pairs with the READ_ONCE in read_iter: concurrent
+             * reads on one fd may touch this field while we restamp it.
+             */
+            WRITE_ONCE(
+                record->cached_gen,
+                dnsfs_cache_generation(cfg, record->fqdn, record->qtype));
+        }
         ret = 0;
     }
     kfree(line);
@@ -1030,17 +1083,64 @@ static int dnsfs_record_refresh(struct inode *inode, struct file *file)
 
 static int dnsfs_record_open(struct inode *inode, struct file *file)
 {
-    return dnsfs_record_refresh(inode, file);
+    struct dentry *dentry = file_dentry(file);
+    struct dnsfs_record_file *record;
+    struct dentry *parent;
+    int ret;
+
+    record = kzalloc(sizeof(*record), GFP_KERNEL);
+    if (!record)
+        return -ENOMEM;
+    parent = dget_parent(dentry);
+    ret = dnsfs_path_to_fqdn(parent, record->fqdn, sizeof(record->fqdn));
+    dput(parent);
+    if (ret)
+        goto out_free;
+    record->qtype = dnsfs_qtype(&dentry->d_name);
+    file->private_data = record;
+
+    ret = dnsfs_record_refresh(inode, file);
+    if (ret)
+        goto out_clear;
+    return 0;
+
+out_clear:
+    file->private_data = NULL;
+out_free:
+    kfree(record);
+    return ret;
 }
 
 static ssize_t dnsfs_record_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
+    struct file *file = iocb->ki_filp;
+    struct dnsfs_config *cfg = file_inode(file)->i_sb->s_fs_info;
+    struct dnsfs_record_file *record = file->private_data;
+    unsigned long gen;
     int ret;
 
-    ret = dnsfs_record_refresh(file_inode(iocb->ki_filp), iocb->ki_filp);
-    if (ret)
-        return ret;
+    /* Refresh unless the cache entry that filled our pages is still the live
+     * one. dnsfs_cache_generation() returns 0 for absent/non-cacheable/expired
+     * answers, which must never match an earlier stamp. Any non-zero value
+     * other than what we last stamped means the answer moved, so our page cache
+     * is stale.
+     */
+    if (cfg->sock && record && record->qtype) {
+        gen = dnsfs_cache_generation(cfg, record->fqdn, record->qtype);
+        if (!gen || gen != READ_ONCE(record->cached_gen)) {
+            ret = dnsfs_record_refresh(file_inode(file), file);
+            if (ret)
+                return ret;
+        }
+    }
     return generic_file_read_iter(iocb, to);
+}
+
+static int dnsfs_record_release(struct inode *inode, struct file *file)
+{
+    kfree(file->private_data);
+    file->private_data = NULL;
+    return 0;
 }
 
 static int dnsfs_record_read_folio(struct file *file, struct folio *folio)
@@ -1102,6 +1202,7 @@ static const struct address_space_operations dnsfs_record_aops = {
 static const struct file_operations dnsfs_record_ops = {
     .open = dnsfs_record_open,
     .read_iter = dnsfs_record_read_iter,
+    .release = dnsfs_record_release,
     .llseek = generic_file_llseek,
 };
 
@@ -1991,16 +2092,23 @@ static int __init dnsfs_init(void)
     int ret;
 
     dnsfs_proc_dir = proc_mkdir("fs/dnsfs", NULL);
-    if (dnsfs_proc_dir)
+    if (dnsfs_proc_dir) {
         dnsfs_proc_wire_queries = !!proc_create(
             "wire_queries", 0444, dnsfs_proc_dir, &dnsfs_proc_wire_queries_ops);
+        dnsfs_proc_record_refreshes =
+            !!proc_create("record_refreshes", 0444, dnsfs_proc_dir,
+                          &dnsfs_proc_record_refreshes_ops);
+    }
     ret = register_filesystem(&dnsfs_type);
     if (ret) {
         if (dnsfs_proc_wire_queries)
             remove_proc_entry("wire_queries", dnsfs_proc_dir);
+        if (dnsfs_proc_record_refreshes)
+            remove_proc_entry("record_refreshes", dnsfs_proc_dir);
         if (dnsfs_proc_dir)
             remove_proc_entry("fs/dnsfs", NULL);
         dnsfs_proc_wire_queries = false;
+        dnsfs_proc_record_refreshes = false;
         dnsfs_proc_dir = NULL;
     }
     return ret;
@@ -2011,9 +2119,12 @@ static void __exit dnsfs_exit(void)
     unregister_filesystem(&dnsfs_type);
     if (dnsfs_proc_wire_queries)
         remove_proc_entry("wire_queries", dnsfs_proc_dir);
+    if (dnsfs_proc_record_refreshes)
+        remove_proc_entry("record_refreshes", dnsfs_proc_dir);
     if (dnsfs_proc_dir)
         remove_proc_entry("fs/dnsfs", NULL);
     dnsfs_proc_wire_queries = false;
+    dnsfs_proc_record_refreshes = false;
     dnsfs_proc_dir = NULL;
 }
 

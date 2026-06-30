@@ -48,10 +48,11 @@ struct dnsfs_cache_entry {
     struct list_head list;  /* LRU order for the shrinker's reclaim */
     struct rcu_head rcu;    /* deferred free after a grace period */
     struct dnsfs_cache_key key;
-    int err;              /* negative-cache errno (rcode map), else 0 */
-    unsigned long expiry; /* jiffies deadline: TTL as object lifetime */
-    size_t len;           /* valid bytes in text */
-    bool refreshing;      /* an async TTL refresh is already in flight */
+    int err;                  /* negative-cache errno (rcode map), else 0 */
+    unsigned long expiry;     /* jiffies deadline: TTL as object lifetime */
+    unsigned long generation; /* per-mount cache generation token */
+    size_t len;               /* valid bytes in text */
+    bool refreshing;          /* an async TTL refresh is already in flight */
     char text[DNSFS_RECORD_TEXT_MAX]; /* presentation form served to readers */
 };
 
@@ -79,6 +80,7 @@ struct dnsfs_config {
     struct list_head cache;
     struct rhashtable cache_ht;
     unsigned int cache_entries;
+    atomic_long_t cache_generation;
     /* Query kthread queue: readers enqueue misses/refreshes here and either
      * wait or coalesce onto a request already on query_pending (in-flight
      * dedup).
@@ -159,6 +161,9 @@ int dnsfs_query_record(struct dnsfs_config *cfg,
                        size_t out_len,
                        struct address_space *mapping);
 void dnsfs_cache_drop(struct dnsfs_config *cfg, const char *fqdn, u16 qtype);
+unsigned long dnsfs_cache_generation(struct dnsfs_config *cfg,
+                                     const char *fqdn,
+                                     u16 qtype);
 void dnsfs_cache_drop_storage(struct dnsfs_config *cfg,
                               const char *parent,
                               const char *label,

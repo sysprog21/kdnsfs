@@ -546,7 +546,7 @@ static int has_edns_do(const uint8_t *p, size_t len)
 }
 
 struct opts {
-    int truncated, nxdomain, ttl, rcode, bad_txid;
+    int truncated, nxdomain, ttl, ttl0, rcode, bad_txid;
     int delay_ms;
     unsigned long ttl0_after;
     int bad_qname, bad_qtype, bad_qclass;
@@ -1028,6 +1028,8 @@ int main(int argc, char **argv)
             o.nxdomain = 1;
         else if (!strcmp(a, "--ttl1"))
             o.ttl = 1;
+        else if (!strcmp(a, "--ttl0"))
+            o.ttl0 = 1;
         else if (!strncmp(a, "--ttl0-after=", 13))
             o.ttl0_after = strtoul(a + 13, NULL, 10);
         else if (!strcmp(a, "--bad-txid"))
@@ -1137,7 +1139,7 @@ int main(int argc, char **argv)
                 continue;
             struct opts ro = o;
             ro.truncated = truncate_udp;
-            if (ro.ttl0_after && query_count > ro.ttl0_after)
+            if (ro.ttl0 || (ro.ttl0_after && query_count > ro.ttl0_after))
                 ro.ttl = 0;
             size_t rn = build_response(pkt, n, &ro, resp);
             if (!rn)
@@ -1197,7 +1199,7 @@ int main(int argc, char **argv)
             }
             struct opts ro = o;
             ro.truncated = 0;
-            if (ro.ttl0_after && query_count > ro.ttl0_after)
+            if (ro.ttl0 || (ro.ttl0_after && query_count > ro.ttl0_after))
                 ro.ttl = 0;
             size_t rn = build_response(pkt, want, &ro, resp);
             uint8_t frame[2 + MAX_RESP];

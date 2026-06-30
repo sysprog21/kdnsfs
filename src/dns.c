@@ -914,6 +914,7 @@ static bool dnsfs_cache_store(struct dnsfs_config *cfg,
     entry->len = len;
     entry->refreshing = false;
     entry->expiry = jiffies + ttl_sec * HZ;
+    entry->generation = atomic_long_inc_return(&cfg->cache_generation);
     stored = dnsfs_cache_insert_entry(cfg, entry);
     dnsfs_cache_evict_tail(cfg);
     return stored;
@@ -943,6 +944,7 @@ static bool dnsfs_cache_store_error(struct dnsfs_config *cfg,
     entry->len = 0;
     entry->refreshing = false;
     entry->expiry = jiffies + ttl_sec * HZ;
+    entry->generation = atomic_long_inc_return(&cfg->cache_generation);
     stored = dnsfs_cache_insert_entry(cfg, entry);
     dnsfs_cache_evict_tail(cfg);
     return stored;
@@ -1238,6 +1240,27 @@ void dnsfs_cache_drop(struct dnsfs_config *cfg, const char *fqdn, u16 qtype)
     if (entry)
         dnsfs_cache_remove_entry(cfg, entry);
     mutex_unlock(&cfg->query_lock);
+}
+
+unsigned long dnsfs_cache_generation(struct dnsfs_config *cfg,
+                                     const char *fqdn,
+                                     u16 qtype)
+{
+    struct dnsfs_cache_key key = {.qtype = qtype};
+    struct dnsfs_cache_entry *entry;
+    unsigned long gen = 0;
+
+    strscpy(key.name, fqdn, sizeof(key.name));
+    rcu_read_lock();
+    entry = rhashtable_lookup_fast(&cfg->cache_ht, &key, dnsfs_cache_params);
+    /* 0 is reserved to mean absent or expired. Non-zero values are assigned
+     * when a cache entry is stored, so a caller can tell "still the same cached
+     * answer I read" from "the cache changed under me".
+     */
+    if (entry && time_before(jiffies, entry->expiry))
+        gen = entry->generation;
+    rcu_read_unlock();
+    return gen;
 }
 
 void dnsfs_cache_drop_storage(struct dnsfs_config *cfg,
