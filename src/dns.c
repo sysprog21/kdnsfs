@@ -410,8 +410,11 @@ static int dnsfs_render_txt(struct dns_msg *msg,
             if (dnsfs_wire_name_text(rr->rdata, rr->rdlength, target,
                                      sizeof(target)))
                 return -EIO;
+            ret = dnsfs_append(out, out_len, &pos, "%s\n", target);
+            if (ret)
+                return ret;
             *ttl = min_ttl;
-            return scnprintf(out, out_len, "%s\n", target);
+            return pos;
         }
         case 6: { /* SOA */
             char mname[DNSFS_MAX_NAME + 1];
@@ -477,8 +480,11 @@ static int dnsfs_render_txt(struct dns_msg *msg,
             ret = dnsfs_append(out, out_len, &pos, "\n");
             break;
         default:
+            ret = dnsfs_append(out, out_len, &pos, "%u %s\n", qtype, fqdn);
+            if (ret)
+                return ret;
             *ttl = min_ttl;
-            return scnprintf(out, out_len, "%u %s\n", qtype, fqdn);
+            return pos;
         }
         if (ret)
             return ret;
@@ -794,12 +800,14 @@ static int dnsfs_cache_lookup(struct dnsfs_config *cfg,
         return -EAGAIN;
     }
 
+    /* Opportunistic sweep of OTHER expired entries. The caller's own entry was
+     * already handled above; mapping belongs to that file, not to these, so do
+     * not touch it here -- invalidating it once per reaped entry would
+     * needlessly blow away the current file's page cache N times.
+     */
     list_for_each_entry_safe (entry, tmp, &cfg->cache, list) {
-        if (time_after_eq(jiffies, entry->expiry) && !entry->refreshing) {
+        if (time_after_eq(jiffies, entry->expiry) && !entry->refreshing)
             dnsfs_cache_remove_entry(cfg, entry);
-            if (mapping)
-                invalidate_mapping_pages(mapping, 0, -1);
-        }
     }
     return -EAGAIN;
 }
@@ -983,6 +991,7 @@ static int dnsfs_query_record_sync(struct dnsfs_config *cfg,
 
     mutex_lock(&cfg->query_lock);
     cfg->sock->sk->sk_rcvtimeo = msecs_to_jiffies(cfg->timeout_ms);
+    cfg->sock->sk->sk_sndtimeo = msecs_to_jiffies(cfg->timeout_ms);
 
     if (!force_wire) {
         ret = dnsfs_cache_lookup(cfg, fqdn, qtype, out, out_len, mapping, false,
@@ -1003,7 +1012,16 @@ static int dnsfs_query_record_sync(struct dnsfs_config *cfg,
         for (resolver = 0; resolver < cfg->nameserver_count; resolver++) {
             ret = dnsfs_query_udp_once(cfg, cfg->nameservers[resolver], fqdn,
                                        qtype, out, out_len, &ttl);
-            if (ret != -ETIMEDOUT)
+            /* Stop on a definitive disposition: a hit, an authoritative
+             * NXDOMAIN (-ENOENT), a resolver refusal (-EACCES) or malformed
+             * query error (-EINVAL) that another resolver would only repeat, or
+             * a local resource error (-ENOMEM, -ENOSPC) that failover cannot
+             * fix. Only transient resolver failures (timeout, SERVFAIL or a
+             * junk reply as -EIO, and socket unreachability) fall through to
+             * the next nameserver.
+             */
+            if (ret > 0 || ret == -ENOENT || ret == -EACCES || ret == -EINVAL ||
+                ret == -ENOMEM || ret == -ENOSPC)
                 goto out_store;
         }
     }
@@ -1235,11 +1253,12 @@ void dnsfs_cache_drop_storage(struct dnsfs_config *cfg,
     int meta_len;
     int index_len;
 
-    meta_len = scnprintf(meta, sizeof(meta), "%.*s.%s", (int) label_len, label,
-                         parent);
+    meta_len =
+        snprintf(meta, sizeof(meta), "%.*s.%s", (int) label_len, label, parent);
     index_len =
-        scnprintf(index, sizeof(index), "%s.%s", DNSFS_STORAGE_INDEX, parent);
-    if (meta_len >= sizeof(meta) || index_len >= sizeof(index))
+        snprintf(index, sizeof(index), "%s.%s", DNSFS_STORAGE_INDEX, parent);
+    if (meta_len < 0 || (size_t) meta_len >= sizeof(meta) || index_len < 0 ||
+        (size_t) index_len >= sizeof(index))
         return;
 
     mutex_lock(&cfg->query_lock);
