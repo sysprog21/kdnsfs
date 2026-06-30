@@ -98,6 +98,13 @@ static void bump_count(void)
     fclose(f);
 }
 
+static int set_reuse_addr(int fd)
+{
+    int one = 1;
+
+    return setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+}
+
 /* Append a wire-encoded domain name; returns bytes written. */
 static size_t wire_name(const char *name, uint8_t *out)
 {
@@ -1096,12 +1103,10 @@ int main(int argc, char **argv)
 
     int udp = socket(AF_INET, SOCK_DGRAM, 0);
     int tcp = socket(AF_INET, SOCK_STREAM, 0);
-    int one = 1;
 
     if (udp < 0 || tcp < 0)
         return perror("socket"), 1;
-    if (setsockopt(udp, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) ||
-        setsockopt(tcp, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)))
+    if (set_reuse_addr(udp) || set_reuse_addr(tcp))
         return perror("setsockopt"), 1;
     if (bind(udp, (struct sockaddr *) &addr, sizeof(addr)))
         return perror("udp bind"), 1;
