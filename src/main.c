@@ -500,7 +500,7 @@ static void dnsfs_storage_apply_inode_meta(struct inode *inode,
     if (cfg->writable)
         inode->i_mode |= 0200;
     i_size_write(inode, meta->size);
-    inode_set_mtime_to_ts(inode, (struct timespec64){.tv_sec = meta->mtime});
+    inode_set_mtime_to_ts(inode, (struct timespec64) {.tv_sec = meta->mtime});
 }
 
 static int dnsfs_storage_pin_meta(struct file *file,

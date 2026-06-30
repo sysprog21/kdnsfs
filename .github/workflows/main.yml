@@ -1,0 +1,87 @@
+# Parallel jobs (all independent, fan out on every push/PR):
+#   lint         : clang-format-20, trailing newline, unsafe-function scan,
+#                  cppcheck on the parser
+#   parser-fuzz  : userspace parser under ASan+UBSan, no kernel needed
+#   kernel-check : build the module against the runner kernel and run the
+#                  tests/driver.sh suite (mount, TTL, NXDOMAIN, storage,
+#                  publisher publish/delete), then scan dmesg. Runs twice in
+#                  parallel: fast (incremental) and thorough (clean rebuild,
+#                  1M fuzz iters, 100x load/unload, TTL expiry).
+#
+# kernel-check loads a real .ko via sudo insmod: GitHub runners allow this (no
+# Secure Boot / lockdown). The module is built against the running kernel's
+# headers so vermagic matches.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install clang-format-20 and cppcheck
+        run: |
+          pip install clang-format==20.1.8
+          sudo apt-get update
+          sudo apt-get install -y cppcheck
+
+      - name: Check trailing newline
+        run: .ci/check-newline.sh
+
+      - name: Check clang-format
+        env:
+          CLANG_FORMAT: clang-format
+        run: .ci/check-format.sh
+
+      - name: Security checks
+        run: .ci/check-security.sh
+
+      - name: Static analysis (cppcheck, parser)
+        run: .ci/check-cppcheck.sh
+
+  parser-fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and fuzz parser (ASan+UBSan)
+        run: |
+          cc -Wall -Wextra -Werror -fsanitize=address,undefined -g \
+             -o /tmp/fuzz tests/test-parser.c src/parser.c
+          /tmp/fuzz 1000000
+
+  kernel-check:
+    name: kernel-check (${{ matrix.mode }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: fast
+            thorough: 0
+            timeout: 20
+          - mode: thorough
+            thorough: 1
+            timeout: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install kernel headers and tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-headers-$(uname -r)" kmod
+
+      - name: Build module and publisher
+        run: make
+
+      - name: Run test suite (make check)
+        run: make check
+        env:
+          THOROUGH: ${{ matrix.thorough }}
