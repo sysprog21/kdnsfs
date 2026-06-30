@@ -231,24 +231,23 @@ static int dnsfs_validate_zone_source(const char *zone)
 
 /* Turn a VFS path into a DNS FQDN. Walking dentry up to the mount root collects
  * labels deepest-first, which reverses path order into DNS order, and each
- * label is lower-cased on the way out before the zone suffix is appended. The
- * stack bound and per-label/total-length checks reject paths that cannot encode
- * a legal DNS name rather than overrun buf.
+ * label is lower-cased on the way out before the zone suffix is appended. Most
+ * lookups are shallow, so keep the common dentry stack on the kernel stack and
+ * allocate only for unusually deep paths. The stack bound and
+ * per-label/total-length checks reject paths that cannot encode a legal DNS
+ * name rather than overrun buf.
  */
 static int dnsfs_path_to_fqdn(struct dentry *dentry, char *buf, size_t size)
 {
     struct super_block *sb = dentry->d_sb;
     struct dnsfs_config *cfg = sb->s_fs_info;
-    struct dentry **stack;
+    struct dentry *fast[16];
+    struct dentry **stack = fast;
     struct dentry *cur;
     size_t pos = 0;
     int depth = 0;
     int i;
     int ret;
-
-    stack = kcalloc(DNSFS_MAX_NAME / 2, sizeof(*stack), GFP_KERNEL);
-    if (!stack)
-        return -ENOMEM;
 
     cur = dget(dentry);
     while (cur != sb->s_root) {
@@ -258,6 +257,18 @@ static int dnsfs_path_to_fqdn(struct dentry *dentry, char *buf, size_t size)
             dput(cur);
             ret = -ENAMETOOLONG;
             goto out_put_stack;
+        }
+        if (depth == ARRAY_SIZE(fast)) {
+            struct dentry **heap;
+
+            heap = kcalloc(DNSFS_MAX_NAME / 2, sizeof(*heap), GFP_KERNEL);
+            if (!heap) {
+                dput(cur);
+                ret = -ENOMEM;
+                goto out_put_stack;
+            }
+            memcpy(heap, fast, sizeof(fast));
+            stack = heap;
         }
         if (depth == DNSFS_MAX_NAME / 2) {
             dput(cur);
@@ -284,18 +295,21 @@ static int dnsfs_path_to_fqdn(struct dentry *dentry, char *buf, size_t size)
     }
 
     ret = dnsfs_append_zone(buf, size, &pos, cfg->zone);
-    kfree(stack);
+    if (stack != fast)
+        kfree(stack);
     return ret;
 
 out_put_stack_from:
     while (i < depth)
         dput(stack[i++]);
-    kfree(stack);
+    if (stack != fast)
+        kfree(stack);
     return ret;
 out_put_stack:
     while (--depth >= 0)
         dput(stack[depth]);
-    kfree(stack);
+    if (stack != fast)
+        kfree(stack);
     return ret;
 }
 
@@ -499,6 +513,10 @@ static void dnsfs_storage_apply_inode_meta(struct inode *inode,
     inode->i_mode = S_IFREG | (meta->mode & 0777);
     if (cfg->writable)
         inode->i_mode |= 0200;
+    /* Lockless i_size store, same call as dnsfs_record_refresh (TODO B5): a
+     * plain aligned store on the 64-bit target. A 32-bit SMP target would need
+     * inode_lock here and around the matching i_size_read in the read path.
+     */
     i_size_write(inode, meta->size);
     inode_set_mtime_to_ts(inode, (struct timespec64) {.tv_sec = meta->mtime});
 }
@@ -933,7 +951,7 @@ static int dnsfs_storage_commit(struct file *file)
          * if the post-publish metadata refresh below fails. Refresh meta so a
          * same-fd read/write sees the new epoch/size; on failure leave
          * meta_stale set and let load_write_cache (or assemble's retry) re-pin
-         * later — never turn a successful publish into a sticky write_err.
+         * later, never turn a successful publish into a sticky write_err.
          */
         storage->dirty = false;
         storage->write_err = 0;
@@ -1179,13 +1197,19 @@ static int dnsfs_storage_flush(struct file *file, fl_owner_t id)
 static int dnsfs_storage_release(struct inode *inode, struct file *file)
 {
     struct dnsfs_storage_file *storage = file->private_data;
+    bool need_commit = false;
 
     /* ->flush already committed on close(); only commit here if it never ran
-     * (no explicit close) and didn't already fail — avoids a redundant socket
-     * retry of a commit that just errored.
+     * (no explicit close) and didn't already fail, avoids a redundant socket
+     * retry of a commit that just errored. Read dirty/write_err under the lock:
+     * a dup'd fd's concurrent ->flush mutates them while this final fput runs.
      */
-    if ((file->f_mode & FMODE_WRITE) && storage && storage->dirty &&
-        !storage->write_err)
+    if ((file->f_mode & FMODE_WRITE) && storage) {
+        mutex_lock(&storage->lock);
+        need_commit = storage->dirty && !storage->write_err;
+        mutex_unlock(&storage->lock);
+    }
+    if (need_commit)
         dnsfs_storage_commit(file);
     kfree(storage);
     file->private_data = NULL;
@@ -1406,6 +1430,8 @@ static const char *dnsfs_get_link(struct dentry *dentry,
         return target;
     }
     kfree(line);
+    if (ret == 0)      /* query succeeded but produced no link body */
+        ret = -ENOENT; /* never return ERR_PTR(0) (NULL) to ->get_link */
     return ERR_PTR(ret);
 
 synthetic:
@@ -1600,13 +1626,17 @@ static int dnsfs_iterate_shared(struct file *file, struct dir_context *ctx)
 {
     struct dentry *dentry = file_dentry(file);
     struct dnsfs_config *cfg = dentry->d_sb->s_fs_info;
-    unsigned int i;
-    loff_t base_pos;
+    loff_t base_pos = 2 + ARRAY_SIZE(dnsfs_types);
 
     if (!dir_emit_dots(file, ctx))
         return 0;
 
-    for (i = ctx->pos - 2; i < ARRAY_SIZE(dnsfs_types); i++) {
+    /* ctx->pos is a 64-bit user-seekable offset; compare it as loff_t before
+     * indexing so a wild seekdir() value cannot truncate back into the type
+     * table or the index array and re-emit stale entries.
+     */
+    while (ctx->pos >= 2 && ctx->pos < base_pos) {
+        unsigned int i = ctx->pos - 2;
         unsigned char type =
             dnsfs_types[i].kind == DNSFS_SYMLINK ? DT_LNK : DT_REG;
 
@@ -1616,13 +1646,12 @@ static int dnsfs_iterate_shared(struct file *file, struct dir_context *ctx)
         ctx->pos = i + 3;
     }
 
-    base_pos = 2 + ARRAY_SIZE(dnsfs_types);
     if (cfg->storage && cfg->sock && ctx->pos >= base_pos) {
         struct dnsfs_index_entry entries[DNSFS_MAX_INDEX_ENTRIES];
         char fqdn[DNSFS_MAX_NAME + 1];
         char *line;
         size_t count = 0;
-        size_t start = ctx->pos - base_pos;
+        loff_t start = ctx->pos - base_pos;
         int ret;
 
         line = kmalloc(DNSFS_RECORD_TEXT_MAX, GFP_KERNEL);
@@ -1642,19 +1671,49 @@ static int dnsfs_iterate_shared(struct file *file, struct dir_context *ctx)
             kfree(line);
             return ret;
         }
-        for (i = start; i < count; i++) {
-            if (!dir_emit(ctx, entries[i].name, entries[i].name_len,
-                          base_pos + i, DT_UNKNOWN)) {
+        for (; start < (loff_t) count; start++) {
+            if (!dir_emit(ctx, entries[start].name, entries[start].name_len,
+                          base_pos + start, DT_UNKNOWN)) {
                 kfree(line);
                 return 0;
             }
-            ctx->pos = base_pos + i + 1;
+            ctx->pos = base_pos + start + 1;
         }
         kfree(line);
     }
 
     return 0;
 }
+
+/* DNS state changes out from under the dcache: a name can begin resolving, go
+ * NXDOMAIN, or (in storage mode) be published/removed by the publisher. The DNS
+ * TTL cache is the real cache here, so rather than pin dentries past their TTL
+ * we re-run lookup for the cases that can change and let that cache absorb the
+ * cost -- staleness is then bounded by the record's TTL, not by dcache
+ * eviction.
+ *
+ * A positive dentry on a plain (non-storage) mount is structural -- a label is
+ * always a directory, a record-type leaf is always that type -- so it stays
+ * valid and keeps the dcache fast path; content freshness lives in the read
+ * path. The mount root, negative dentries, and every storage dentry re-resolve.
+ */
+static int dnsfs_d_revalidate(struct inode *dir,
+                              const struct qstr *name,
+                              struct dentry *dentry,
+                              unsigned int flags)
+{
+    struct dnsfs_config *cfg = dentry->d_sb->s_fs_info;
+
+    if (IS_ROOT(dentry) || (d_inode(dentry) && !cfg->storage))
+        return 1;
+    if (flags & LOOKUP_RCU)
+        return -ECHILD; /* re-lookup sleeps on DNS; bail to ref-walk */
+    return 0;
+}
+
+static const struct dentry_operations dnsfs_dentry_ops = {
+    .d_revalidate = dnsfs_d_revalidate,
+};
 
 static const struct inode_operations dnsfs_dir_inode_ops = {
     .lookup = dnsfs_lookup,
@@ -1707,6 +1766,7 @@ static int dnsfs_fill_super(struct super_block *sb, struct fs_context *fc)
     sb->s_blocksize = PAGE_SIZE;
     sb->s_blocksize_bits = PAGE_SHIFT;
     sb->s_op = &dnsfs_super_ops;
+    set_default_d_op(sb, &dnsfs_dentry_ops);
     sb->s_fs_info = cfg;
 
     /* Storage mode is useless without a resolver, so default to the local
