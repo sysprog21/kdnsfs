@@ -70,8 +70,8 @@ log()
     echo ">> $*" >&2
 }
 
-# Compile a userspace helper and fail loudly if the compiler produced nothing
-# (a silent no-output cc otherwise surfaces as a confusing "not found" later).
+# Compile a userspace helper and fail loudly if the compiler produced nothing (a
+# silent no-output cc otherwise surfaces as a confusing "not found" later).
 build_helper()
 {
     out=$1
@@ -109,6 +109,15 @@ wire_queries()
         exit 1
     fi
     cat /proc/fs/dnsfs/wire_queries
+}
+
+record_refreshes()
+{
+    if [ ! -r /proc/fs/dnsfs/record_refreshes ]; then
+        echo "missing /proc/fs/dnsfs/record_refreshes" >&2
+        exit 1
+    fi
+    cat /proc/fs/dnsfs/record_refreshes
 }
 
 drop_dns_pid()
@@ -365,6 +374,32 @@ expect_cached_record()
     expect_dns_count "$count" "$context"
 }
 
+# Two small reads of one open file, asserting how many page-cache refreshes they
+# trigger. The open refreshes once; while the cache stays fresh neither read
+# refreshes again, so a cacheable answer advances the counter by 1. A
+# non-cacheable (ttl=0) answer forces a refresh on every read, the pre-fastpath
+# behavior, so its expected delta is 3.
+expect_small_read_refresh()
+{
+    path=$1
+    context=$2
+    expected=$3
+
+    refresh_before=$(record_refreshes)
+    python3 - "$path" <<'PY'
+import os
+import sys
+
+with open(sys.argv[1], "rb", buffering=0) as f:
+    if os.read(f.fileno(), 4) != b"dnsf":
+        raise SystemExit("first small read mismatch")
+    if os.read(f.fileno(), 4) != b"s li":
+        raise SystemExit("second small read mismatch")
+PY
+    refresh_after=$(record_refreshes)
+    expect_delta "$refresh_before" "$refresh_after" "$expected" "$context"
+}
+
 expect_multi_record()
 {
     flag=$1
@@ -448,7 +483,8 @@ unmount_dnsfs()
 }
 
 # Build the module + userspace helpers, run the parser self-test, and prep the
-# mount point. THOROUGH forces a clean rebuild; otherwise the build is incremental.
+# mount point. THOROUGH forces a clean rebuild; otherwise the build is
+# incremental.
 prepare()
 {
     cd "$repo"
@@ -468,8 +504,9 @@ prepare()
         tools/check-d-type.c
     build_helper /tmp/dnsfs-dns-server -Wall -Wextra -Werror -g \
         tests/dns-server.c
-    # Redirect stdin from /dev/null: the harness reads stdin first (corpus mode),
-    # so without this it blocks waiting for EOF on an interactive terminal.
+    # Redirect stdin from /dev/null: the harness reads stdin first (corpus
+    # mode), so without this it blocks waiting for EOF on an interactive
+    # terminal.
     log "parser self-test"
     /tmp/dnsfs-fuzz-parser </dev/null
     if [ "$fuzz_runs" -gt 0 ]; then
@@ -481,7 +518,8 @@ prepare()
     sudo dmesg -C 2>/dev/null || true
 }
 
-# Live records cache + presentation for every record type, plus the proc counter.
+# Live records cache + presentation for every record type, plus the proc
+# counter.
 test_live_records()
 {
     start_dns "$dns_port" --count-file "$dns_count" --expect-do=1
@@ -489,6 +527,7 @@ test_live_records()
     mount_dnsfs -o "nameserver=127.0.0.2;127.0.0.1",port="$dns_port",timeout=250,retries=1,dnssec example.org
     wire_before=$(wire_queries)
     expect_cached_record TXT "dnsfs live" 1 "TXT cache"
+    expect_small_read_refresh "$mnt/TXT" "TXT small-read cache" 1
     expect_cached_record A "192.0.2.1" 2 "A cache"
     expect_cached_record AAAA "2001:db8::1" 3 "AAAA cache"
     expect_cached_record MX "10 mail.example.org." 4 "MX cache"
@@ -582,7 +621,8 @@ test_cache_reclaim()
     stop_dns
 }
 
-# Positive-TTL expiry + open-fd refresh. Slow (sleeps past a 1s TTL): THOROUGH only.
+# Positive-TTL expiry + open-fd refresh. Slow (sleeps past a 1s TTL): THOROUGH
+# only.
 test_positive_ttl()
 {
     [ "$thorough" = 1 ] || return 0
@@ -673,6 +713,13 @@ PY
         echo "TTL0 refresh left stale cache entry live" >&2
         exit 1
     fi
+    unmount_dnsfs
+    stop_dns
+
+    start_dns "$dns_ttl0_port" --ttl0 --count-file "$dns_count"
+    rm -f "$dns_count"
+    mount_dnsfs -o nameserver=127.0.0.1,port="$dns_ttl0_port",timeout=250,retries=1 example.org
+    expect_small_read_refresh "$mnt/TXT" "TTL0 small-read refresh" 3
     unmount_dnsfs
     stop_dns
 }
@@ -788,7 +835,8 @@ PY
     stop_dns
 }
 
-# A duplicate index fails readdir EIO; an uppercase (malformed) index fails EINVAL.
+# A duplicate index fails readdir EIO; an uppercase (malformed) index fails
+# EINVAL.
 test_storage_bad_index()
 {
     start_dns "$dns_bad_index_port" --storage --bad-storage-index
@@ -1110,7 +1158,8 @@ test_bad_rdata()
     done
 }
 
-# Mismatched txid/qname/qtype/qclass/source-port responses are dropped (ETIMEDOUT).
+# Mismatched txid/qname/qtype/qclass/source-port responses are dropped
+# (ETIMEDOUT).
 test_bad_response()
 {
     for bad_response_case in "1 --bad-txid" "2 --bad-qname" "3 --bad-qtype" "4 --bad-qclass" "5 --wrong-source-port"; do
@@ -1200,7 +1249,8 @@ PY
 }
 
 # Invalid mount sources, options, and zone names are all rejected before mount.
-# Assumes the module is already loaded (by test_synthetic); unloads it at the end.
+# Assumes the module is already loaded (by test_synthetic); unloads it at the
+# end.
 test_mount_validation()
 {
     sudo /tmp/dnsfs-mount-no-source
