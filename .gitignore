@@ -1,0 +1,15 @@
+externals/
+*.cmd
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.o
+*.order
+*.symvers
+.cache.mk
+.tmp_versions/
+.*.swp
+__pycache__/
+Module.markers
+modules.order
