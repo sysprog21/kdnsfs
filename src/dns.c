@@ -35,6 +35,7 @@
 #include <linux/spinlock.h>
 #include <linux/stdarg.h>
 #include <linux/string.h>
+#include <linux/timer.h>
 #include <linux/uio.h>
 #include <linux/umh.h>
 #include <linux/wait.h>
@@ -71,8 +72,54 @@ static void dnsfs_cache_remove_entry(struct dnsfs_config *cfg,
     call_rcu(&entry->rcu, dnsfs_cache_free_rcu);
 }
 
+/* Schedule the next purge sweep while the cache is non-empty. Only the kthread
+ * runs the sweep, so do nothing without one; timer_pending keeps a burst of
+ * stores from repeatedly pushing the deadline out.
+ */
+static void dnsfs_cache_arm_timer(struct dnsfs_config *cfg)
+{
+    if (cfg->query_thread && !timer_pending(&cfg->cache_timer))
+        mod_timer(&cfg->cache_timer, jiffies + DNSFS_PURGE_INTERVAL_SEC * HZ);
+}
+
+/* Timer/softirq context: do only what the context allows -- no cache walk, no
+ * allocation, no sleeping (I6). Flag the sweep and wake the kthread, which does
+ * the reaping under query_lock in process context.
+ */
+static void dnsfs_cache_timer_fn(struct timer_list *t)
+{
+    struct dnsfs_config *cfg = timer_container_of(cfg, t, cache_timer);
+
+    atomic_set(&cfg->purge_pending, 1);
+    wake_up(&cfg->query_wait);
+}
+
+/* Time-driven counterpart to the opportunistic sweep in dnsfs_cache_lookup:
+ * reap every entry whose TTL has elapsed and that is not mid-refresh, so an
+ * idle mount does not keep dead entries alive until the next miss or memory
+ * pressure. Runs in the kthread (process context) under query_lock, never in
+ * the timer itself. An entry being served stale (refreshing) is left for the
+ * demand path to replace. Re-arm while entries remain so later expiries are
+ * still collected.
+ */
+static void dnsfs_cache_purge_expired(struct dnsfs_config *cfg)
+{
+    struct dnsfs_cache_entry *entry;
+    struct dnsfs_cache_entry *tmp;
+
+    mutex_lock(&cfg->query_lock);
+    list_for_each_entry_safe (entry, tmp, &cfg->cache, list) {
+        if (time_after_eq(jiffies, entry->expiry) && !entry->refreshing)
+            dnsfs_cache_remove_entry(cfg, entry);
+    }
+    if (!list_empty(&cfg->cache))
+        dnsfs_cache_arm_timer(cfg);
+    mutex_unlock(&cfg->query_lock);
+}
+
 int dnsfs_cache_init(struct dnsfs_config *cfg)
 {
+    timer_setup(&cfg->cache_timer, dnsfs_cache_timer_fn, 0);
     return rhashtable_init(&cfg->cache_ht, &dnsfs_cache_params);
 }
 
@@ -90,6 +137,11 @@ void dnsfs_free_config(struct dnsfs_config *cfg)
         kthread_stop(cfg->query_thread);
         cfg->query_thread = NULL;
     }
+    /* The kthread is the only side that re-arms the timer, so once it is
+     * stopped timer_shutdown_sync cancels any pending or running sweep for
+     * good, before the cache it walks is drained below.
+     */
+    timer_shutdown_sync(&cfg->cache_timer);
     if (cfg->sock)
         sock_release(cfg->sock);
     while (!list_empty(&cfg->cache)) {
@@ -942,6 +994,7 @@ static bool dnsfs_cache_store(struct dnsfs_config *cfg,
     entry->generation = atomic_long_inc_return(&cfg->cache_generation);
     stored = dnsfs_cache_insert_entry(cfg, entry);
     dnsfs_cache_evict_tail(cfg);
+    dnsfs_cache_arm_timer(cfg);
     return stored;
 }
 
@@ -972,6 +1025,7 @@ static bool dnsfs_cache_store_error(struct dnsfs_config *cfg,
     entry->generation = atomic_long_inc_return(&cfg->cache_generation);
     stored = dnsfs_cache_insert_entry(cfg, entry);
     dnsfs_cache_evict_tail(cfg);
+    dnsfs_cache_arm_timer(cfg);
     return stored;
 }
 
@@ -1093,9 +1147,12 @@ int dnsfs_query_thread(void *data)
     for (;;) {
         struct dnsfs_query_request *req = NULL;
 
-        wait_event_interruptible(
-            cfg->query_wait,
-            kthread_should_stop() || !list_empty(&cfg->query_queue));
+        wait_event_interruptible(cfg->query_wait,
+                                 kthread_should_stop() ||
+                                     !list_empty(&cfg->query_queue) ||
+                                     atomic_read(&cfg->purge_pending));
+        if (atomic_xchg(&cfg->purge_pending, 0))
+            dnsfs_cache_purge_expired(cfg);
         spin_lock(&cfg->query_queue_lock);
         if (!list_empty(&cfg->query_queue)) {
             req = list_first_entry(&cfg->query_queue,

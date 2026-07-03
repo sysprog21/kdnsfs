@@ -31,6 +31,7 @@ dns_bad_index_port=$((22000 + ($$ % 5000)))
 dns_publisher_port=$((29000 + ($$ % 5000)))
 dns_multi_port=$((21000 + ($$ % 5000)))
 dns_signal_port=$((46000 + ($$ % 3000)))
+dns_purge_port=$((33000 + ($$ % 3000)))
 dns_count=${TMPDIR:-/tmp}/dnsfs-count.$$
 parallel_dir=${TMPDIR:-/tmp}/dnsfs-parallel.$$
 storage_out=${TMPDIR:-/tmp}/dnsfs-storage.$$
@@ -721,6 +722,44 @@ PY
     rm -f "$dns_count"
     mount_dnsfs -o nameserver=127.0.0.1,port="$dns_ttl0_port",timeout=250,retries=1 example.org
     expect_small_read_refresh "$mnt/TXT" "TTL0 small-read refresh" 3
+    unmount_dnsfs
+    stop_dns
+}
+
+# E2: the cache_timer purges expired entries time-driven, with no read to trigger
+# the demand-path sweep. Fill one entry (TTL 1), never read it again, and after
+# the purge interval elapses the entry must be gone -- a read then blocks on the
+# slow resolver (a real miss), where a lingering stale entry would have answered
+# instantly. THOROUGH only (sleeps past TTL + purge interval).
+test_purge_timer()
+{
+    [ "$thorough" = 1 ] || return 0
+    start_dns "$dns_purge_port" --ttl1 --delay-ms=600 --count-file "$dns_count"
+    rm -f "$dns_count"
+    mount_dnsfs -o nameserver=127.0.0.1,port="$dns_purge_port",timeout=2000,retries=1 example.org
+    expect_file_content "$mnt/TXT" "dnsfs live" "purge timer fill"
+    expect_dns_count 1 "purge timer fill count"
+    sleep 7
+    python3 - "$mnt/TXT" "$dns_count" <<'PY'
+import pathlib
+import sys
+import time
+
+path = pathlib.Path(sys.argv[1])
+count_file = pathlib.Path(sys.argv[2])
+start = time.monotonic()
+got = path.read_text().strip()
+elapsed = time.monotonic() - start
+if got != "dnsfs live":
+    raise SystemExit(f"unexpected purge-timer read: {got!r}")
+# A lingering stale entry answers instantly; a real miss blocks on the 600ms
+# resolver, proving the timer purged the expired entry with no read to trigger it.
+if elapsed < 0.3:
+    raise SystemExit(f"read too fast ({elapsed:.3f}s): entry was not purged")
+count = int(count_file.read_text().strip())
+if count != 2:
+    raise SystemExit(f"expected 2 wire queries after purge + miss, got {count}")
+PY
     unmount_dnsfs
     stop_dns
 }
@@ -1464,6 +1503,7 @@ test_cache_eviction
 test_cache_reclaim
 test_positive_ttl
 test_async_ttl_refresh
+test_purge_timer
 test_signal_interrupt
 test_tcp_fallback
 test_multi_record
