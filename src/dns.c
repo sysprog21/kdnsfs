@@ -603,11 +603,29 @@ static int dnsfs_query_tcp(struct dnsfs_config *cfg,
     request[0] = query_len >> 8;
     request[1] = query_len;
     memcpy(request + 2, query, query_len);
-    vec.iov_base = request;
-    vec.iov_len = query_len + 2;
-    ret = kernel_sendmsg(sock, &msg, &vec, 1, vec.iov_len);
-    if (ret < 0)
-        goto out_sock;
+    /* TCP is a byte stream, so one kernel_sendmsg can send fewer bytes than the
+     * whole framed query. Loop until all of it goes out, and treat a
+     * zero-length send as a stuck connection rather than spinning.
+     */
+    {
+        size_t total_sent = 0;
+        size_t to_send = query_len + 2;
+
+        while (total_sent < to_send) {
+            struct msghdr send_msg = {.msg_name = NULL};
+
+            vec.iov_base = request + total_sent;
+            vec.iov_len = to_send - total_sent;
+            ret = kernel_sendmsg(sock, &send_msg, &vec, 1, vec.iov_len);
+            if (ret < 0)
+                goto out_sock;
+            if (ret == 0) {
+                ret = -EIO;
+                goto out_sock;
+            }
+            total_sent += ret;
+        }
+    }
     atomic64_inc(&dnsfs_wire_queries);
 
     vec.iov_base = reply;
@@ -700,6 +718,13 @@ static int dnsfs_query_udp_once(struct dnsfs_config *cfg,
                              send_vec.iov_len);
         if (ret < 0)
             break;
+        /* A UDP datagram sends whole or not at all; a short count means the
+         * query never left intact, so fail rather than wait for a reply to it.
+         */
+        if (ret != send_vec.iov_len) {
+            ret = -EIO;
+            break;
+        }
         atomic64_inc(&dnsfs_wire_queries);
         ret = kernel_recvmsg(cfg->sock, &recv_msg, &recv_vec, 1,
                              DNSFS_MAX_PACKET, 0);
@@ -1214,15 +1239,25 @@ int dnsfs_query_record(struct dnsfs_config *cfg,
         return ret;
 
 wait:
+    /* A signal aborts the wait immediately instead of blocking out the whole
+     * query. The shared request stays queued, so the worker still resolves it,
+     * fills the cache, and wakes the other coalesced waiters; this caller just
+     * drops its reference and returns -ERESTARTSYS. Whoever drops the last
+     * reference frees the request, so leaving early is use-after-free safe. Do
+     * not read req->ret or req->text on the signal path: the worker may still
+     * be writing them, and only a completed request has them stable.
+     */
     wait_ret = wait_for_completion_interruptible(&req->done);
-    if (wait_ret)
-        wait_for_completion(&req->done);
-    ret = wait_ret ? -ERESTARTSYS : req->ret;
-    if (ret > 0) {
-        if (req->len > out_len)
-            ret = -ENOSPC;
-        else
-            memcpy(out, req->text, req->len);
+    if (wait_ret) {
+        ret = -ERESTARTSYS;
+    } else {
+        ret = req->ret;
+        if (ret > 0) {
+            if (req->len > out_len)
+                ret = -ENOSPC;
+            else
+                memcpy(out, req->text, req->len);
+        }
     }
     if (refcount_dec_and_test(&req->refs))
         kfree(req);

@@ -606,7 +606,9 @@ static int dnsfs_storage_assemble_once(struct file *file,
 {
     struct dentry *dentry = file_dentry(file);
     struct dnsfs_config *cfg = dentry->d_sb->s_fs_info;
-    struct dnsfs_file_meta *meta = &storage->meta;
+    struct dnsfs_file_meta local_meta;
+    char local_epoch[DNSFS_MAX_LABEL + 1];
+    struct dnsfs_file_meta *meta = &local_meta;
     struct dnsfs_decoded_chunk *chunks = NULL;
     char (*labels)[DNSFS_MAX_LABEL + 1] = NULL;
     u8 *chunk_data = NULL;
@@ -614,6 +616,16 @@ static int dnsfs_storage_assemble_once(struct file *file,
     char *line = NULL;
     int ret;
     u32 i;
+
+    /* Snapshot meta + epoch into locals. The read path runs without
+     * storage->lock, so a concurrent re-pin must not grow chunk_count or size
+     * between the allocations and the loop bounds that use them. A torn
+     * generation is caught later by the epoch/CRC checks and retried, so it can
+     * never overrun the buffers sized here.
+     */
+    local_meta = storage->meta;
+    memcpy(local_epoch, storage->epoch, sizeof(local_epoch));
+    local_meta.epoch = local_epoch;
 
     line = kmalloc(DNSFS_RECORD_TEXT_MAX, GFP_KERNEL);
     if (!line) {
@@ -728,7 +740,9 @@ static int dnsfs_storage_read_range_once(struct file *file,
 {
     struct dentry *dentry = file_dentry(file);
     struct dnsfs_config *cfg = dentry->d_sb->s_fs_info;
-    struct dnsfs_file_meta *meta = &storage->meta;
+    struct dnsfs_file_meta local_meta;
+    char local_epoch[DNSFS_MAX_LABEL + 1];
+    struct dnsfs_file_meta *meta = &local_meta;
     u32 first = start / DNSFS_CHUNK_SIZE;
     u32 last = (start + out_len - 1) / DNSFS_CHUNK_SIZE;
     char label[DNSFS_MAX_LABEL + 1];
@@ -737,12 +751,22 @@ static int dnsfs_storage_read_range_once(struct file *file,
     char *line = NULL;
     int ret;
     u32 i;
+    bool verify_full;
+
+    /* Snapshot meta + epoch into locals; see dnsfs_storage_assemble_once. The
+     * lockless read path must not let a concurrent re-pin change size or
+     * chunk_count under the allocations and bounds below.
+     */
+    local_meta = storage->meta;
+    memcpy(local_epoch, storage->epoch, sizeof(local_epoch));
+    local_meta.epoch = local_epoch;
+
     /* A read covering the whole file also gets a whole-file CRC check; pull the
      * decoded bytes into one buffer so dnsfs_crc32c_verify can validate them.
      * This second buffer (TODO B6) is bounded by DNSFS_MAX_STORAGE_SIZE, capped
      * in dnsfs_storage_validate_meta, so it can never exceed that ceiling.
      */
-    bool verify_full = (start == 0 && out_len >= meta->size);
+    verify_full = (start == 0 && out_len >= meta->size);
 
     if (!out_len)
         return 0;

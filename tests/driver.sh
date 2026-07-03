@@ -30,6 +30,7 @@ dns_storage_port=$((23000 + ($$ % 5000)))
 dns_bad_index_port=$((22000 + ($$ % 5000)))
 dns_publisher_port=$((29000 + ($$ % 5000)))
 dns_multi_port=$((21000 + ($$ % 5000)))
+dns_signal_port=$((46000 + ($$ % 3000)))
 dns_count=${TMPDIR:-/tmp}/dnsfs-count.$$
 parallel_dir=${TMPDIR:-/tmp}/dnsfs-parallel.$$
 storage_out=${TMPDIR:-/tmp}/dnsfs-storage.$$
@@ -724,6 +725,58 @@ PY
     stop_dns
 }
 
+# A signal must abort a read blocked on a slow resolver promptly, not wait out
+# the whole query (E1). The resolver delays every answer 3s; a cat is
+# interrupted ~0.3s in and must die from the signal well before that, proving
+# the foreground waiter no longer falls into an uninterruptible wait after the
+# signal.
+test_signal_interrupt()
+{
+    start_dns "$dns_signal_port" --delay-ms=3000 --count-file "$dns_count"
+    rm -f "$dns_count"
+    mount_dnsfs -o nameserver=127.0.0.1,port="$dns_signal_port",timeout=5000,retries=1 example.org
+    python3 - "$mnt/TXT" "$dns_count" <<'PY'
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+path = sys.argv[1]
+count_file = pathlib.Path(sys.argv[2])
+proc = subprocess.Popen(["cat", path],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+# The fixture bumps the count before its 3s delay, so count>=1 proves the worker
+# already sent the wire query and cat is parked in the interruptible wait -- a
+# fixed sleep could race and signal cat before it ever blocks in the kernel.
+deadline = time.monotonic() + 2.0
+while time.monotonic() < deadline:
+    try:
+        if int(count_file.read_text().strip() or "0") >= 1:
+            break
+    except (FileNotFoundError, ValueError):
+        pass
+    time.sleep(0.01)
+else:
+    proc.kill()
+    raise SystemExit("resolver never saw the query; cat never blocked")
+start = time.monotonic()
+proc.send_signal(signal.SIGINT)
+try:
+    proc.wait(timeout=2.0)
+except subprocess.TimeoutExpired:
+    proc.kill()
+    raise SystemExit("interrupted read did not return (blocked >2s on the query)")
+elapsed = time.monotonic() - start
+if elapsed > 1.0:
+    raise SystemExit(f"interrupted read returned slowly: {elapsed:.3f}s")
+if proc.returncode != -signal.SIGINT:
+    raise SystemExit(f"cat exit {proc.returncode}, expected SIGINT termination")
+PY
+    unmount_dnsfs
+    stop_dns
+}
+
 # A truncated UDP response forces a TCP retry (exactly two transport queries).
 test_tcp_fallback()
 {
@@ -1411,6 +1464,7 @@ test_cache_eviction
 test_cache_reclaim
 test_positive_ttl
 test_async_ttl_refresh
+test_signal_interrupt
 test_tcp_fallback
 test_multi_record
 test_storage
