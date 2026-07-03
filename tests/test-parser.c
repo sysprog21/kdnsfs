@@ -146,6 +146,49 @@ static void selftest(void)
                                    4) == -ENOSPC);
     assert(dnsfs_build_chunk_label(&meta, "file", 4, 2 * DNSFS_CHUNK_SIZE,
                                    label, sizeof(label)) == -EIO);
+    /* B8 label-boundary audit: every synthesized label must be proven a valid
+     * DNS label (<=63 bytes) before it can hit the wire, not just accepted when
+     * parsed back. A name at the 63-byte cap is fine, one past it is EINVAL,
+     * and a name that fits alone but pushes "epoch-offset-name" past 63 is
+     * rejected with ENAMETOOLONG before the buffer-space check.
+     */
+    {
+        char n63[DNSFS_MAX_LABEL];
+        char n64[DNSFS_MAX_LABEL + 1];
+        char wide[64];
+
+        memset(n63, 'a', sizeof(n63));
+        memset(n64, 'a', sizeof(n64));
+        memset(wide, 'a', sizeof(wide));
+        assert(dnsfs_build_chunk_label(&meta, n63, DNSFS_MAX_LABEL, 0, label,
+                                       sizeof(label)) == -ENAMETOOLONG);
+        assert(dnsfs_build_chunk_label(&meta, n64, DNSFS_MAX_LABEL + 1, 0,
+                                       label, sizeof(label)) == -EINVAL);
+        /* "e" + "-" + "0" + "-" + 60 chars == 64 > 63: the combined-length gate
+         * fires even though the name alone (60) is a legal label.
+         */
+        assert(dnsfs_build_chunk_label(&meta, wide, 60, 0, label,
+                                       sizeof(label)) == -ENAMETOOLONG);
+    }
+    /* B9 untrusted-metadata audit: storage metadata is DNS input, so an
+     * overlong epoch label and non-hex CRC text must both be rejected by the
+     * parser. The chunk-count overflow, size/chunk-count mismatch, and
+     * short-CRC cases are already covered above.
+     */
+    {
+        struct dnsfs_file_meta bad_meta;
+        char meta_bad[DNSFS_MAX_TXT];
+        int meta_len;
+        char epoch64[DNSFS_MAX_LABEL + 1];
+
+        memset(epoch64, 'a', sizeof(epoch64));
+        meta_len =
+            snprintf(meta_bad, sizeof(meta_bad), "0 100444 0 0 %.*s 00000000",
+                     DNSFS_MAX_LABEL + 1, epoch64);
+        assert(dnsfs_parse_file_meta(meta_bad, meta_len, &bad_meta) == -EINVAL);
+        assert(dnsfs_parse_file_meta("0 100444 0 0 e zzzzzzzz", 23,
+                                     &bad_meta) == -EINVAL);
+    }
     assert(dnsfs_parse_chunk_name("e-0-file", 8, &chunk) == 0);
     assert(dnsfs_chunk_expected_len(&meta, &chunk, &chunk_len) == 0);
     assert(chunk_len == DNSFS_CHUNK_SIZE);

@@ -739,6 +739,8 @@ static int dnsfs_storage_read_range_once(struct file *file,
     u32 i;
     /* A read covering the whole file also gets a whole-file CRC check; pull the
      * decoded bytes into one buffer so dnsfs_crc32c_verify can validate them.
+     * This second buffer (TODO B6) is bounded by DNSFS_MAX_STORAGE_SIZE, capped
+     * in dnsfs_storage_validate_meta, so it can never exceed that ceiling.
      */
     bool verify_full = (start == 0 && out_len >= meta->size);
 
@@ -1060,6 +1062,10 @@ static int dnsfs_record_refresh(struct inode *inode, struct file *file)
     atomic64_inc(&dnsfs_record_refreshes);
     ret = dnsfs_record_fill(file, line);
     if (ret >= 0) {
+        /* Lockless i_size store (TODO B5): a plain aligned store on the 64-bit
+         * target. A 32-bit SMP target would need inode_lock here and around the
+         * matching i_size_read in the read path.
+         */
         i_size_write(inode, ret);
         invalidate_mapping_pages(inode->i_mapping, 0, -1);
         /* Stamp the generation these freshly-filled pages now reflect, so a
@@ -1718,10 +1724,65 @@ static struct dentry *dnsfs_lookup(struct inode *dir,
     return d_splice_alias(inode, dentry);
 }
 
+/* Frozen view of a storage directory's index, taken once at opendir. The parsed
+ * entries point into line, so the snapshot owns both. Pinning it keeps ctx->pos
+ * offsets and positional inode numbers stable across a telldir/seekdir walk
+ * even if the publisher rewrites the index mid-iteration.
+ */
+struct dnsfs_dir_snapshot {
+    char line[DNSFS_RECORD_TEXT_MAX];
+    struct dnsfs_index_entry entries[DNSFS_MAX_INDEX_ENTRIES];
+    size_t count;
+};
+
+static int dnsfs_dir_open(struct inode *inode, struct file *file)
+{
+    struct dentry *dentry = file_dentry(file);
+    struct dnsfs_config *cfg = dentry->d_sb->s_fs_info;
+    struct dnsfs_dir_snapshot *snap;
+    char fqdn[DNSFS_MAX_NAME + 1];
+    int ret;
+
+    /* Plain mounts have no index to snapshot; readdir emits only the fixed
+     * record-type leaves, which need no per-open state.
+     */
+    if (!(cfg->storage && cfg->sock))
+        return 0;
+
+    snap = kzalloc(sizeof(*snap), GFP_KERNEL);
+    if (!snap)
+        return -ENOMEM;
+
+    ret = dnsfs_path_to_fqdn(dentry, fqdn, sizeof(fqdn));
+    if (!ret)
+        ret = dnsfs_query_txt_child(cfg, fqdn, DNSFS_STORAGE_INDEX,
+                                    strlen(DNSFS_STORAGE_INDEX), snap->line,
+                                    sizeof(snap->line));
+    if (ret > 0)
+        ret = dnsfs_parse_index_txt(snap->line, ret, snap->entries,
+                                    ARRAY_SIZE(snap->entries), &snap->count);
+    if (ret == -ENOENT) /* no index TXT (NXDOMAIN or no match): empty dir */
+        ret = 0;
+    if (ret) {
+        kfree(snap);
+        return ret;
+    }
+    file->private_data = snap;
+    return 0;
+}
+
+static int dnsfs_dir_release(struct inode *inode, struct file *file)
+{
+    kfree(file->private_data);
+    file->private_data = NULL;
+    return 0;
+}
+
 /* No AXFR, no zone walk. readdir emits only "." "..", the fixed record-type
  * leaf files, and -- in storage mode -- the children named by this directory's
- * index TXT. A plain mount therefore lists just the record-type files; the
- * actual records under a label only materialize when something looks them up.
+ * index TXT snapshot. A plain mount therefore lists just the record-type files;
+ * the actual records under a label only materialize when something looks them
+ * up.
  */
 static int dnsfs_iterate_shared(struct file *file, struct dir_context *ctx)
 {
@@ -1748,39 +1809,18 @@ static int dnsfs_iterate_shared(struct file *file, struct dir_context *ctx)
     }
 
     if (cfg->storage && cfg->sock && ctx->pos >= base_pos) {
-        struct dnsfs_index_entry entries[DNSFS_MAX_INDEX_ENTRIES];
-        char fqdn[DNSFS_MAX_NAME + 1];
-        char *line;
-        size_t count = 0;
+        struct dnsfs_dir_snapshot *snap = file->private_data;
         loff_t start = ctx->pos - base_pos;
-        int ret;
 
-        line = kmalloc(DNSFS_RECORD_TEXT_MAX, GFP_KERNEL);
-        if (!line)
-            return -ENOMEM;
-        ret = dnsfs_path_to_fqdn(dentry, fqdn, sizeof(fqdn));
-        if (!ret)
-            ret = dnsfs_query_txt_child(cfg, fqdn, DNSFS_STORAGE_INDEX,
-                                        strlen(DNSFS_STORAGE_INDEX), line,
-                                        DNSFS_RECORD_TEXT_MAX);
-        if (ret > 0)
-            ret = dnsfs_parse_index_txt(line, ret, entries, ARRAY_SIZE(entries),
-                                        &count);
-        if (ret == -ENOENT)
-            ret = 0;
-        if (ret) {
-            kfree(line);
-            return ret;
-        }
-        for (; start < (loff_t) count; start++) {
-            if (!dir_emit(ctx, entries[start].name, entries[start].name_len,
-                          base_pos + start, DT_UNKNOWN)) {
-                kfree(line);
+        if (!snap) /* opendir raced a mount going read-only; nothing to list */
+            return 0;
+        for (; start < (loff_t) snap->count; start++) {
+            if (!dir_emit(ctx, snap->entries[start].name,
+                          snap->entries[start].name_len, base_pos + start,
+                          DT_UNKNOWN))
                 return 0;
-            }
             ctx->pos = base_pos + start + 1;
         }
-        kfree(line);
     }
 
     return 0;
@@ -1823,6 +1863,8 @@ static const struct inode_operations dnsfs_dir_inode_ops = {
 };
 
 static const struct file_operations dnsfs_dir_ops = {
+    .open = dnsfs_dir_open,
+    .release = dnsfs_dir_release,
     .iterate_shared = dnsfs_iterate_shared,
     .llseek = generic_file_llseek,
 };
