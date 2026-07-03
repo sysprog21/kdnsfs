@@ -1087,6 +1087,89 @@ PY
     stop_dns
 }
 
+# B7 writeback regression: a publisher failure must surface on fsync (EIO),
+# leave the dirty file intact and unpublished, and not poison the retry that
+# succeeds once the publisher recovers.
+test_writeback_retry()
+{
+    flaky_store="$build_dir/flaky-store"
+    flaky_pub="$build_dir/flaky-publisher"
+    sudo rm -rf "$flaky_store"
+    mkdir -p "$flaky_store"
+    # put: if the arm marker exists, consume it and fail BEFORE writing so the
+    # store keeps the previous version; otherwise write the raw payload.
+    cat >"$flaky_pub" <<EOF
+#!/bin/sh
+set -eu
+root='$flaky_store'
+case "\$1" in
+put)
+    if [ -e "\$root/.failnext" ]; then
+        rm -f "\$root/.failnext"
+        exit 1
+    fi
+    python3 - "\$root" "\$2" "\${3:-}" <<'PY'
+import os, sys
+root, label, hex_payload = sys.argv[1:]
+with open(os.path.join(root, label), "wb") as f:
+    f.write(bytes.fromhex(hex_payload))
+PY
+    ;;
+del)
+    rm -f "\$root/\$2"
+    ;;
+*)
+    exit 1
+    ;;
+esac
+EOF
+    chmod +x "$flaky_pub"
+    start_dns "$dns_publisher_port" --serve-dir="$flaky_store" --ttl1 --count-file "$dns_count"
+    mount_dnsfs -o nameserver=127.0.0.1,publisher="$flaky_pub",port="$dns_publisher_port",timeout=250,retries=1,storage example.org
+    sudo python3 - "$mnt/retryf" "$flaky_store/retryf" "$flaky_store/.failnext" <<'PY'
+import errno, os, sys
+
+path, store, marker = sys.argv[1:]
+
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+os.write(fd, b"one")
+os.fsync(fd)
+os.close(fd)
+if open(store, "rb").read() != b"one":
+    raise SystemExit("initial publish did not persist")
+
+# Overwrite, arm the publisher to fail, and expect fsync to surface EIO.
+fd = os.open(path, os.O_RDWR)
+os.lseek(fd, 0, os.SEEK_SET)
+os.write(fd, b"two")
+open(marker, "w").close()
+try:
+    os.fsync(fd)
+except OSError as exc:
+    if exc.errno != errno.EIO:
+        raise SystemExit(f"fsync got errno {exc.errno}, expected EIO")
+else:
+    raise SystemExit("fsync unexpectedly succeeded while publisher failing")
+# Dirty state intact and unpublished: the store still holds the old version.
+if open(store, "rb").read() != b"one":
+    raise SystemExit("failed publish corrupted the stored file")
+
+# Retry on the same fd now that the publisher recovered: must succeed and the
+# earlier write_err must not poison it.
+os.fsync(fd)
+if open(store, "rb").read() != b"two":
+    raise SystemExit("retry did not publish the dirty file")
+os.fsync(fd)  # third fsync: clean state, still returns success
+os.close(fd)
+PY
+    unmount_dnsfs
+    mount_dnsfs -o nameserver=127.0.0.1,publisher="$flaky_pub",port="$dns_publisher_port",timeout=250,retries=1,storage example.org
+    expect_file_content "$mnt/retryf" "two" "writeback retry persisted"
+    unmount_dnsfs
+    stop_dns
+    sudo rm -rf "$flaky_store"
+}
+
 # NXDOMAIN reads are negatively cached: two failing reads, one resolver query.
 test_negative_cache()
 {
@@ -1333,6 +1416,7 @@ test_multi_record
 test_storage
 test_storage_bad_index
 test_storage_publisher
+test_writeback_retry
 test_negative_cache
 test_negative_ttl
 test_rcode_mapping
