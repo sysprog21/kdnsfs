@@ -15,6 +15,7 @@
 #include <linux/rhashtable.h>
 #include <linux/shrinker.h>
 #include <linux/spinlock.h>
+#include <linux/timer.h>
 #include <linux/types.h>
 #include <linux/wait.h>
 
@@ -29,6 +30,11 @@
 #define DNSFS_MAX_TTL_SEC 3600
 #define DNSFS_RECORD_TEXT_MAX 384
 #define DNSFS_MAX_CACHE_ENTRIES 64
+/* How often the cache_timer sweeps expired entries (E2). Kept well above the
+ * gap between an entry's expiry and a demand read, so the M11 stale-serve path
+ * still wins for entries that are actually read soon after they expire.
+ */
+#define DNSFS_PURGE_INTERVAL_SEC 5
 #define DNSFS_STORAGE_INDEX "index"
 #define DNSFS_MAX_STORAGE_CHUNKS 64
 #define DNSFS_MAX_STORAGE_SIZE (DNSFS_CHUNK_SIZE * DNSFS_MAX_STORAGE_CHUNKS)
@@ -81,6 +87,8 @@ struct dnsfs_config {
     struct rhashtable cache_ht;
     unsigned int cache_entries;
     atomic_long_t cache_generation;
+    struct timer_list cache_timer; /* E2: time-driven expired-entry purge */
+    atomic_t purge_pending;        /* timer asks the kthread to sweep */
     /* Query kthread queue: readers enqueue misses/refreshes here and either
      * wait or coalesce onto a request already on query_pending (in-flight
      * dedup).
