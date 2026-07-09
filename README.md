@@ -1,347 +1,386 @@
-# kdnsfs: in-kernel filesystem backed by DNS for Linux
+# kdnsfs: DNS as a Linux kernel filesystem
 
-`kdnsfs` is a Linux kernel module that mounts DNS as a filesystem.
-Remote resolvers are read-only. Storage mounts are read-write only when they
-explicitly name a userspace publisher with `-o storage,publisher=...`.
-The project is named `kdnsfs`; the module name and mount filesystem type are
-`dnsfs`.
+`kdnsfs` is a teaching Linux kernel module. The module and mount filesystem type
+are named `dnsfs`.
 
-This is an educational project: each stage introduces one kernel subsystem
-(VFS, kernel sockets, the page cache, kthreads, memory reclaim) through one
-coherent idea.
-> A filesystem is fundamentally a *namespace* abstraction, not a *storage* one.
+The core idea:
 
-DNS is already a hierarchical, delegated, cached namespace.
-`kdnsfs` exposes it through the VFS so you can `cd`, `ls`, and `cat` it:
+> A filesystem is fundamentally a namespace abstraction, not a storage
+> abstraction.
 
-| DNS concept            | Filesystem concept                        |
-| ---------------------- | ----------------------------------------- |
-| zone (`example.org.`)  | the mount root                            |
-| label (`www`)          | a directory                               |
-| resource record (`A`)  | a file, in zone-presentation form         |
-| `CNAME`                | a symlink                                 |
-| `NXDOMAIN`             | `ENOENT` / a negative dentry              |
-| TTL                    | cache lifetime of an object               |
-| TXT records            | raw bytes of a stored file (storage mode) |
+DNS already is a distributed, delegated, cached namespace. `dnsfs` exposes that
+namespace through Linux VFS so students can `cd`, `ls`, `cat`, and observe how
+ordinary DNS concepts line up with filesystem concepts.
 
-## The namespace mapping
+| DNS concept | Filesystem concept |
+| --- | --- |
+| zone, for example `example.org.` | mount root |
+| label, for example `www` | directory |
+| resource record, for example `TXT` | regular file |
+| `CNAME` | symlink |
+| `NXDOMAIN` | `ENOENT` / negative dentry |
+| TTL | cache lifetime |
+| TXT records in storage mode | file bytes |
 
-Mounting pins the root to a single zone. It is a mountable filesystem,
-not a global DNS browser:
+This is not trying to make DNS a good disk. It is trying to make filesystem
+internals, DNS resolution, TTL caching, negative dentries, page cache behavior,
+and usermode helpers visible through one coherent experiment.
 
-```sh
-sudo mount -t dnsfs example.org /mnt        # / is now example.org.
-```
+## Live Learning Loop
 
-A path is the DNS name *under that zone*, with the labels reversed and lower-cased.
-Record types are upper-case leaf files; the content is the zone-presentation form,
-one resource record per line:
-
-```
-/mnt
-├── TXT                      # TXT of example.org.        -> "dnsfs live"
-├── A                        # A   of example.org.        -> "192.0.2.1"
-├── MX                       #                            -> "10 mail.example.org."
-├── SOA  NS  DS  DNSKEY  AAAA
-├── CNAME -> target          # a symlink, not a file
-└── miek/
-    └── a/                   # path miek/a  ==  a.miek.example.org.
-        ├── TXT
-        └── A
-```
-
-So `/mnt/miek/a/TXT` issues a `TXT` query for `a.miek.example.org.`.
-
-### Why the mapping is exact, not a gimmick
-
-Linux's VFS is a *namespace multiplexer*: the "everything is a file" idea from Plan 9,
-where unlike resources are reached through one hierarchical name tree.
-DNS independently evolved the same primitives, so the two line up term for term:
-- Hierarchy: Labels nested under a zone are nested directories; resolving a
-  name walks the tree the way `path_lookup` walks dentries.
-- Delegation: A zone cut (`NS` delegation) is exactly a mount point: a
-  subtree owned by a different authority, stitched into one namespace.
-- Lifetime, not bytes: A record's TTL *is* the cache lifetime of an object;
-  `kdnsfs` expires a cached entry when its TTL elapses, the same way a dentry can
-  go stale. There is no durable block store underneath; the namespace is the
-  thing.
-- Negative space: A cached `NXDOMAIN` (negative caching, RFC 2308) is a
-  negative dentry: "known absent, for this long," distinct from "unknown."
-- Indirection: A `CNAME` is a symlink, a name that resolves to another name.
-
-`kdnsfs` doesn't bolt a filesystem onto DNS; it teaches the VFS to read the side DNS already implements.
-Storage mode (below) then pushes the idea further: *content* itself, not just names,
-is carried in the namespace as TXT records.
-
-DNS is not enumerable: there is no `AXFR`, so a plain directory's `readdir` lists only `.`/`..`
-and the reserved record-type files.
-(A *storage* directory additionally lists children from a designated index; see below.)
-
-Errors map to the natural errno:
-
-| DNS rcode / event | errno        |
-| ----------------- | ------------ |
-| `NXDOMAIN`        | `ENOENT`     |
-| `SERVFAIL`        | `EIO`        |
-| `REFUSED`         | `EACCES`     |
-| `FORMERR`         | `EINVAL`     |
-| no response       | `ETIMEDOUT`  |
-
-## Storage mode: files *inside* DNS
-
-With `-o storage`, `kdnsfs` reassembles file contents from TXT records.
-A file is split into fixed-size chunks: about 180 raw bytes per chunk, so the
-base64 payload fits in one 255-byte TXT string.
-
-Each chunk lives at `{epoch}-{base36offset}-{name}` and contains:
-
-```
-<crc32c> <base64-payload>
-```
-
-Per-file metadata (`size mode mtime chunk_count epoch crc32c`) provides inode
-stat fields. EOF comes from `chunk_count`, not from `NXDOMAIN`, because packet
-loss or poisoning could forge a missing chunk. The `epoch` prevents serving a
-mix of stale and fresh chunks.
-
-CRC32c here is integrity only. It detects transport/cache corruption but is
-trivially spoofable. Tamper resistance needs end-to-end DNSSEC validation or a
-trusted resolver, not a checksum.
-
-## System design
-
-Three kernel translation units plus a userspace-shaped parser, split by trust
-boundary and concern:
-
-```
-                 untrusted DNS bytes
-                         │
-   parser.c  ◀───────────┘   pure, allocation-free, fuzzed.
-   (the gate)                Decodes wire messages + the storage encoding.
-                         │   Compiles in userspace too (see tests/test-parser.c).
-                         ▼
-   dns.c                     The resolver engine: build query, UDP/TCP client,
-   (engine)                  response parse, record presentation, the TTL cache,
-                         │   a per-mount query kthread, reclaim hooks.
-                         ▼
-   main.c                    VFS glue: fs_context mount, inode/dir/file/symlink
-   (VFS)                     ops, path↔FQDN mapping, the storage layer, /proc.
-
-   dnsfs.h                   shared structs, #defines, cross-TU prototypes.
-```
-
-- Trust boundary. Everything that touches untrusted network bytes lives in
-  `parser.c`, which never allocates and never trusts its input. It is fuzzed
-  (ASan/UBSan, millions of iterations) *before* the socket layer is allowed to
-  feed it. Touch it and re-fuzz.
-- Concurrency. A reader checks the per-mount TTL cache; on a miss it joins
-  an in-flight `{fqdn,qtype}` request or enqueues a new one and waits on a
-  completion. A single per-mount kthread owns all *resolver* socket I/O, so
-  duplicate misses for the same name collapse into one wire query and no reader
-  ever blocks the network from a VFS atomic section. Storage write commits call
-  the configured publisher only from process context (`fsync`/`close`/`create`/
-  `unlink`), never an atomic one.
-- Page cache. Record and storage reads go through `read_folio` /
-  `readahead`, so repeat reads are served from the page cache; TTL expiry
-  invalidates the mapping before refetch. Storage writes buffer via
-  `write_begin`/`write_end` and commit the whole file to the local publisher on
-  `fsync`/close, then drop the cached pages so the next read reflects the new
-  epoch.
-- Reclaim. The DNS cache is exposed to VFS memory pressure via
-  `super_operations->{nr,free}_cached_objects`, evicting LRU-tail entries.
-
-## Building and running
-
-This is a Linux kernel module. Build, load, mount, and test it inside a Linux
-VM, not on macOS. All commands below run in that Linux shell.
-
-```sh
-make # builds /tmp/kdnsfs-build/dnsfs.ko and /tmp/kdnsfs-build/publisher
-sudo insmod /tmp/kdnsfs-build/dnsfs.ko
-grep -w dnsfs /proc/filesystems  # should print: nodev dnsfs
-sudo mkdir -p /mnt/dnsfs
-```
-
-Synthetic mode needs no resolver. Records are generated, useful for poking
-at the namespace logic:
-
-```sh
-sudo mount -t dnsfs example.org /mnt/dnsfs
-cat /mnt/dnsfs/TXT         # -> TXT example.org. synthetic
-cat /mnt/dnsfs/miek/a/TXT  # -> TXT a.miek.example.org. synthetic
-readlink /mnt/dnsfs/CNAME  # -> target
-sudo umount /mnt/dnsfs
-```
-
-Live mode queries a real resolver.
-Point it at a proper recursive, caching resolver:
-
-```sh
-sudo mount -t dnsfs -o nameserver=1.1.1.1,port=53,timeout=2000,retries=2 example.org /mnt/dnsfs
-cat /mnt/dnsfs/TXT         # -> the real example.org TXT records
-sudo umount /mnt/dnsfs
-```
-
-Avoid pointing it at a local stub like systemd-resolved (`127.0.0.53`):
-such stubs often return `TTL=0` (so nothing is cached) and rate-limit repeats,
-and a single `cat` issues two queries (one to size the file on `open`,
-one to read it).
-The second gets dropped and you see `ETIMEDOUT` (errno 110).
-A real resolver returns a usable TTL, so the read is a cache hit and only one wire query goes out
-(watch `/proc/fs/dnsfs/wire_queries`).
-For fully deterministic local testing, use the bundled `tests/dns-server.c` (see *Debugging*).
-
-Mount options: `nameserver=` (comma/semicolon-separated, up to 4 for failover),
-`publisher=` (absolute userhelper path that maintains storage DNS records),
-`port=`, `timeout=` (ms), `retries=`, `dnssec` (sets the EDNS DO bit),
-`storage`. Finish with `sudo rmmod dnsfs`.
-
-### Publishing files
-
-By default the module only reads; publishing to DNS is a userspace concern.
-Writes are enabled only when the mount explicitly names a publisher executable with
-`publisher=/absolute/path`.
-`make` creates a local validation publisher at `/tmp/kdnsfs-build/publisher`;
-it writes files under `/tmp/kdnsfs-build/publisher-store`.
-If you build with `BUILD_DIR=/tmp/foo`, pass `publisher=/tmp/foo/publisher`.
-
-DNS queries use `nameserver=`, while writes call the publisher as `publisher put
-<label> <hex-payload>` or `publisher del <label>`.
-The publisher must keep the file metadata and chunk records available so later
-mounts can still resolve them.
-
-The kernel never mutates real DNS: a write buffers in the page cache and,
-on `fsync`/close, the whole file is handed to the local publisher,
-which owns the store and re-validates every name.
-
-How soon other DNS servers see a published file depends on the publisher.
-With the bundled local publisher and test resolver,
-updates are visible to that resolver as soon as the publisher command returns.
-With a real DNS publisher,
-authoritative servers see the change only after that publisher updates the zone and any secondaries receive it.
-Recursive resolvers may continue to serve old positive or negative answers until their cached TTL expires,
-so practical visibility is usually "after the old TTL", plus any zone-transfer or provider delay.
-`kdnsfs` does not shorten external DNS caches.
-
-For local validation, run this from the repository root and serve the generated publisher store with the test resolver:
+Build and run inside Linux only. Do not build, load, mount, or test the module
+on macOS; use Lima or another Linux VM.
 
 ```sh
 make
-make dns-server
 sudo insmod /tmp/kdnsfs-build/dnsfs.ko
 sudo mkdir -p /mnt/dnsfs
-sudo /tmp/kdnsfs-build/dns-server 5354 --serve-dir=/tmp/kdnsfs-build/publisher-store &
-dns_pid=$!
-sudo mount -t dnsfs -o storage,nameserver=127.0.0.1,port=5354,publisher=/tmp/kdnsfs-build/publisher example.org /mnt/dnsfs
+```
 
-printf 'hello world\n' | sudo tee /mnt/dnsfs/hello >/dev/null   # publisher put hello
-cat /mnt/dnsfs/hello                     # -> hello world
+Mount against generated synthetic records:
+
+```sh
+sudo mount -t dnsfs example.org /mnt/dnsfs
+cat /mnt/dnsfs/TXT
+cat /mnt/dnsfs/miek/a/TXT
+readlink /mnt/dnsfs/CNAME
+```
+
+Mount against a real recursive resolver:
+
+```sh
 sudo umount /mnt/dnsfs
-sudo mount -t dnsfs -o storage,nameserver=127.0.0.1,port=5354,publisher=/tmp/kdnsfs-build/publisher example.org /mnt/dnsfs
-cat /mnt/dnsfs/hello                     # -> hello world, read back after remount
-sudo rm /mnt/dnsfs/hello                 # unpublishes it
+sudo mount -t dnsfs \
+  -o nameserver=1.1.1.1,port=53,timeout=2000,retries=2 \
+  example.org /mnt/dnsfs
+cat /mnt/dnsfs/TXT
+```
+
+Watch the kernel internals while operating on the mount:
+
+```sh
+sudo python3 tools/dnsfs-vis.py
+```
+
+`dnsfs-vis.py` is an ANSI TUI over live procfs/debugfs state. It shows mounts,
+wire-query counters, record-refresh counters, per-mount resolver config,
+in-flight query state, and the TTL cache. Keys: `j/k` select a mount, `h/l`
+select a sample path, `t` reads that path, `w` runs a bounded burst of real
+dnsfs file operations, `r` refreshes, `q` quits.
+
+For scripts or logs:
+
+```sh
+sudo python3 tools/dnsfs-vis.py --once
+```
+
+## Namespace Mapping
+
+Mounting pins one DNS zone as the root:
+
+```sh
+sudo mount -t dnsfs example.org /mnt/dnsfs
+```
+
+Paths under the mount are reversed into DNS names under that zone. Record types
+are uppercase leaf files:
+
+```text
+/mnt/dnsfs/TXT         -> TXT example.org.
+/mnt/dnsfs/A           -> A   example.org.
+/mnt/dnsfs/miek/a/TXT  -> TXT a.miek.example.org.
+/mnt/dnsfs/miek/a/A    -> A   a.miek.example.org.
+/mnt/dnsfs/CNAME       -> symlink to target
+```
+
+DNS is not generally enumerable, so normal directories list only `.`/`..` and
+the reserved record-type files. Storage mode adds an index record for files it
+publishes.
+
+DNS errors map to ordinary errno values:
+
+| DNS result | errno |
+| --- | --- |
+| `NXDOMAIN` | `ENOENT` |
+| `SERVFAIL` | `EIO` |
+| `REFUSED` | `EACCES` |
+| `FORMERR` | `EINVAL` |
+| timeout | `ETIMEDOUT` |
+
+Avoid local stubs such as `127.0.0.53` for live-mode demos. They often return
+`TTL=0` or rate-limit repeated queries, hiding the cache behavior this project is
+designed to teach.
+
+## Storage Mode
+
+Remote DNS mounts are read-only unless storage mode names a publisher:
+
+```sh
+sudo mount -t dnsfs \
+  -o storage,nameserver=127.0.0.1,port=5354,publisher=/tmp/kdnsfs-build/publisher \
+  example.org /mnt/dnsfs
+```
+
+In storage mode, file bytes are carried in TXT records:
+
+- `index.<zone>` lists published files.
+- `<file>.<zone>` stores metadata: `size mode mtime chunk_count epoch crc32c`.
+- `<epoch>-<base36offset>-<file>.<zone>` stores one chunk as
+  `<crc32c> <base64-payload>`.
+- Chunks are 180 raw bytes so their base64 payload fits in one DNS TXT string.
+
+CRC32c detects corruption, not forgery. Authenticity still needs DNSSEC or a
+trusted resolver. EOF comes from metadata, not from `NXDOMAIN`, because missing
+chunks may be caused by loss, cache poisoning, or stale data.
+
+### Local Publishing
+
+`make` builds one userhelper at `/tmp/kdnsfs-build/publisher`. Without
+`/etc/dnsfs/nsupdate.conf`, it writes to `/tmp/kdnsfs-build/publisher-store`.
+The bundled test DNS server can serve that directory:
+
+```sh
+make dns-server
+/tmp/kdnsfs-build/dns-server 5354 --serve-dir=/tmp/kdnsfs-build/publisher-store &
+dns_pid=$!
+
+sudo mount -t dnsfs \
+  -o storage,nameserver=127.0.0.1,port=5354,publisher=/tmp/kdnsfs-build/publisher \
+  example.org /mnt/dnsfs
+
+printf 'hello world\n' | sudo tee /mnt/dnsfs/hello >/dev/null
+cat /mnt/dnsfs/hello
+sudo rm /mnt/dnsfs/hello
+
 sudo umount /mnt/dnsfs
-sudo rmmod dnsfs
 kill "$dns_pid"
 ```
 
-Without `publisher=`, `-o storage` remains read-only.
-`nameserver` defaults to `127.0.0.1` in storage mode, and `port` (53),
-`timeout`, and `retries` have defaults too.
-File names must be valid lowercase DNS labels.
-Files are capped at a small teaching size, and metadata (mode/owner) is owned by the publisher,
-so `chmod`/`chown` through the mount are not pushed back to DNS.
+### Real DNS Publishing
 
-The smoke suite (build, parser checks, mounts, behavior tests, clean `dmesg`) runs via:
+The same `/tmp/kdnsfs-build/publisher` can publish to an authoritative DNS
+server that accepts RFC 2136 dynamic updates. Add one config file:
 
 ```sh
-make check                 # fast: incremental build, skips slow TTL-timing tests
-THOROUGH=1 make check      # full gate: clean rebuild, 1M-iteration fuzz, 100x load loop
+sudo install -d -m 0755 /etc/dnsfs /var/lib/dnsfs-nsupdate
+sudo install -m 0644 tools/publisher.conf.example /etc/dnsfs/nsupdate.conf
+sudo editor /etc/dnsfs/nsupdate.conf
 ```
 
-## Debugging
+Set `zone=`, `server=`, and optional `key=`. The server must be authoritative
+for the zone; a recursive resolver like `1.1.1.1` cannot accept writes.
 
-- Wire-query counter. Every real DNS query bumps a counter you can watch to
-  confirm caching/coalescing:
-  ```sh
-  cat /proc/fs/dnsfs/wire_queries
-  ```
-- Kernel log. All warnings/oopses surface in `dmesg`; the smoke suite fails
-  if it sees any `WARNING:`/`BUG:`/`Oops`/GPF.
-  ```sh
-  sudo dmesg -w
-  ```
-- Offline test resolver. `tests/dns-server.c` is a self-contained C DNS
-  server that synthesizes live records, every malformed-response case, and the
-  storage layer, with no external DNS or Python needed. The suite drives it; you can
-  too:
-  ```sh
-  make dns-server
-  /tmp/kdnsfs-build/dns-server 5354 --storage &
-  dns_pid=$!
-  sudo insmod /tmp/kdnsfs-build/dnsfs.ko
-  sudo mkdir -p /mnt/dnsfs
-  sudo mount -t dnsfs -o nameserver=127.0.0.1,port=5354,storage example.org /mnt/dnsfs
-  sudo umount /mnt/dnsfs
-  sudo rmmod dnsfs
-  kill "$dns_pid"
-  ```
-  Flags include `--nxdomain`, `--truncate-udp` (forces TCP fallback),
-  `--rcode=N`, `--bad-*-rdata`, `--multi-*`, and `--ttl1`.
-- Parser fuzzing inside Linux. The parser builds in userspace, so you can
-  fuzz it under ASan/UBSan without the kernel. Run this inside a Linux VM:
-  ```sh
-  cc -Wall -Wextra -Werror -fsanitize=address,undefined -g \
-     -o /tmp/pt tests/test-parser.c src/parser.c
-  /tmp/pt 1000000        # deterministic fuzz iterations
-  ```
+Then keep using the same helper:
+
+```sh
+sudo mount -t dnsfs \
+  -o storage,nameserver=1.1.1.1,port=53,publisher=/tmp/kdnsfs-build/publisher \
+  your.zone /mnt/dnsfs
+```
+
+The kernel still never mutates DNS directly. Writes go through the userspace
+publisher via `call_usermodehelper()` as:
+
+```text
+publisher put <label> <hex-payload>
+publisher del <label>
+```
+
+## Architecture
+
+```text
+untrusted DNS bytes
+        |
+        v
+parser.c   allocation-free wire/storage decoder; builds in userspace for fuzzing
+        |
+        v
+dns.c      resolver engine, UDP/TCP socket I/O, TTL cache, query kthread
+        |
+        v
+main.c     VFS glue: mount, dentries, inodes, file ops, storage writeback
+
+dnsfs.h    shared structs and cross-translation-unit contracts
+```
+
+Important boundaries:
+
+- `parser.c` is the trust boundary. It validates DNS wire bytes, storage
+  metadata, chunk names, base64 payloads, and CRC32c.
+- `dns.c` owns resolver I/O and cache mutation. A per-mount kthread performs
+  network work so VFS readers do not block in atomic contexts.
+- `main.c` maps paths to FQDNs, exposes records as files/symlinks, and commits
+  storage writes through the userhelper.
+- Cache entries use TTL as object lifetime. Debug counters and debugfs expose
+  the moving parts for `dnsfs-vis.py`.
+
+## Kernel Concepts in Practice
+
+These are the kernel concepts dnsfs is meant to make concrete. Each one is
+small enough to inspect in one sitting, then observe live with `dnsfs-vis.py`.
+
+### Synchronization and RCU
+
+Hot cache reads use `dnsfs_cache_lookup_rcu()` so VFS read paths can inspect
+immutable cache entries without taking `query_lock`. Writers still serialize
+table/list mutation with `cfg->query_lock`; removed entries are freed only after
+an RCU grace period.
+
+```text
+reader                         writer/kthread                  RCU callback
+------                         --------------                  ------------
+rcu_read_lock()
+lookup entry E
+read E fields                  mutex_lock(query_lock)
+                               remove E from hash/list
+                               call_rcu(E, free_rcu)
+                               mutex_unlock(query_lock)
+still reading E
+rcu_read_unlock()
+                               grace period passes --------->  kfree(E)
+```
+
+Student prompts:
+- Why must an RCU reader avoid blocking on non-preemptible kernels?
+- Why does the writer need a mutex while the reader does not?
+- What fields in `struct dnsfs_cache_entry` must stay immutable for the RCU
+  fast path to be correct?
+
+### Kernel Networking and kthreads
+
+dnsfs does not call a userspace resolver. `dnsfs_query_thread()` owns resolver
+socket I/O, while VFS paths enqueue work and wait for completion. This keeps
+sleeping network operations out of contexts where VFS code may not safely block.
+
+```text
+VFS read / lookup
+      |
+      v
+enqueue dnsfs_query_request
+      |
+      v
+dnsfs_query_thread
+      |
+      +--> dnsfs_query_udp_once() -> kernel_sendmsg() / kernel_recvmsg()
+      |
+      +--> dnsfs_query_tcp()      -> kernel_connect() + stream I/O
+      |
+      v
+complete waiters and publish cache entry
+```
+
+Student prompts:
+- Trigger TCP fallback with the test resolver's truncated UDP response and trace
+  the path from UDP `TC` to `dnsfs_query_tcp()`.
+- Compare UDP datagrams with TCP connection setup in kernel socket code.
+- Watch duplicate readers coalesce into fewer wire queries with
+  `/proc/fs/dnsfs/wire_queries`.
+
+### User-Kernel Boundaries
+
+dnsfs crosses the user/kernel boundary in three visible places:
+
+- `fs_context`: mount options such as `nameserver=`, `storage`, and
+  `publisher=`.
+- procfs/debugfs: counters and per-mount internals consumed by `dnsfs-vis.py`.
+- `call_usermodehelper()`: storage writes invoke the publisher as
+  `publisher put <label> <hex>` or `publisher del <label>`.
+
+```text
+VFS write/fsync
+      |
+      v
+dnsfs storage commit
+      |
+      v
+call_usermodehelper()
+      |
+      v
+publisher put <label> <hex-payload>
+      |
+      v
+exit status becomes writeback success/failure
+```
+
+Student prompts:
+- Audit why `publisher=` must be an absolute path.
+- Check how arguments are passed as `argv[]`, not through a shell.
+- Explain why DNS provider credentials belong in the userspace publisher, not
+  in the kernel module.
+
+### VFS Lifecycle and Page Cache Coherence
+
+Mounting creates an `fs_context`, then a `super_block`; dnsfs stores per-mount
+state in `sb->s_fs_info` as `struct dnsfs_config`.
+
+```text
+struct fs_context
+       |
+       v
+struct super_block  --->  struct dnsfs_config
+       |
+       v
+root dentry
+       |
+       v
+root inode
+```
+
+Record reads go through `dnsfs_record_read_iter()`. When a DNS TTL expires or a
+refresh changes a cache generation, dnsfs invalidates matching page-cache pages
+with `invalidate_mapping_pages()` so file contents and resolver cache do not
+diverge.
+
+Student prompts:
+- Trace one `cat /mnt/dnsfs/TXT` from dentry lookup to page-cache fill.
+- Observe `record_refreshes` while repeatedly reading the same file before and
+  after TTL expiry.
+- Explain why metadata cache expiry and page-cache invalidation must be linked.
+
+## Testing
+
+Run tests inside Linux:
+
+```sh
+make check
+THOROUGH=1 make check
+```
+
+Useful manual checks:
+
+```sh
+grep -w dnsfs /proc/filesystems
+findmnt -t dnsfs
+cat /proc/fs/dnsfs/wire_queries
+cat /proc/fs/dnsfs/record_refreshes
+sudo dmesg -w
+```
+
+The parser can be fuzzed in userspace:
+
+```sh
+cc -Wall -Wextra -Werror -fsanitize=address,undefined -g \
+  -o /tmp/dnsfs-parser tests/test-parser.c src/parser.c
+/tmp/dnsfs-parser 1000000
+```
 
 ## Non-goals
 
-No RFC 2136 / DNS UPDATE / TSIG zone-update path in the kernel. Writes on a
-storage mount go through the local publisher executable. That publisher may
-update a real DNS zone in userspace and must keep the records available for
-later reads; the kernel never mutates real DNS. No DoH/DoT transport, no eBPF
-interception. The plain kernel UDP socket *is* the lesson.
+- No DNS UPDATE, TSIG, provider API token, DoH, or DoT logic in the kernel.
+- No claim that DNS is a practical general-purpose storage layer.
+- No AXFR-style global DNS browsing.
+- No macOS build/test path for the kernel module.
 
-## Further reading
+## Further Reading
 
-The idea of treating DNS as storage or as a filesystem has prior art worth
-reading; `kdnsfs` borrows the namespace mapping but builds it natively in the
-kernel rather than over FUSE or a userspace daemon.
-
-DNS-as-a-filesystem, the direct inspiration:
-
-- Ben Cox, *DNS filesystem: true cloud storage (DNSFS)*: storing files in the
-  caches of open recursive resolvers.
+- Ben Cox, *DNS filesystem: true cloud storage (DNSFS)*:
   <https://blog.benjojo.co.uk/post/dns-filesystem-true-cloud-storage-dnsfs>
-- *DNSFS: a DNS file system* (Invicti), the same trick from a web-security
-  angle. <https://www.invicti.com/blog/web-security/dnsfs-dns-file-system>
-- Talk / demo of a DNS-backed filesystem (video).
-  <https://youtu.be/8hu3SszwgtQ>
-
-The namespace idea this rests on:
-- R. Pike et al., *The Use of Name Spaces in Plan 9*: "everything is a file" and
-  per-process namespaces, the lineage of the VFS view used here.
-- Linux kernel `Documentation/filesystems/vfs.rst` and `path-lookup.rst`: the
-  dentry/inode model, negative dentries, and `read_folio`/`readahead`.
-
-The DNS / encoding standards the mapping leans on:
-- RFC 1034 / RFC 1035: DNS concepts and message format (the wire `parser.c`
-  decodes).
-- RFC 2308: negative caching of DNS queries (the `NXDOMAIN` → negative-dentry
-  mapping and the TTL-as-lifetime model).
-- RFC 1464: storing arbitrary attribute/value pairs in TXT records (storage
-  mode's lineage).
-- RFC 4648: base64, the chunk payload encoding.
-- RFC 6891: EDNS(0), used to set the DNSSEC `DO` bit.
-- RFC 4033 / 4034 / 4035: DNSSEC; the only real defense against cache poisoning
-  (CRC32c here is integrity against corruption, not authenticity).
-- RFC 2136: DNS UPDATE; deliberately *out* of the kernel (a non-goal), left to
-  the userspace publisher.
+- Linux kernel `Documentation/filesystems/vfs.rst` and `path-lookup.rst`.
+- Plan 9 namespace papers for the broader "everything is a file" lineage.
+- RFC 1034 / 1035 for DNS, RFC 2308 for negative caching, RFC 2136 for dynamic
+  DNS update, RFC 6891 for EDNS(0), and RFC 4033-4035 for DNSSEC.
 
 ## License
 
-GPL-2.0-only. The full text is in [`LICENSE`](LICENSE); every source file also
-carries an `SPDX-License-Identifier: GPL-2.0-only` header and the module declares
-`MODULE_LICENSE("GPL")`, so `dnsfs.ko` loads as a GPL-compatible module.
+GPL-2.0-only. See [`LICENSE`](LICENSE). Source files carry SPDX identifiers and
+the module declares `MODULE_LICENSE("GPL")`.
