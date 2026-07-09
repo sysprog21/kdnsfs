@@ -19,6 +19,7 @@
 #include <linux/capability.h>
 #include <linux/cred.h>
 #include <linux/dcache.h>
+#include <linux/debugfs.h>
 #include <linux/delayed_call.h>
 #include <linux/err.h>
 #include <linux/fs.h>
@@ -35,6 +36,7 @@
 #include <linux/pagemap.h>
 #include <linux/proc_fs.h>
 #include <linux/sched/mm.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -89,6 +91,7 @@ static const struct file_operations dnsfs_dir_ops;
 static struct inode *dnsfs_make_inode(struct super_block *sb,
                                       enum dnsfs_kind kind);
 static struct proc_dir_entry *dnsfs_proc_dir;
+static struct dentry *dnsfs_debug_dir;
 atomic64_t dnsfs_wire_queries = ATOMIC64_INIT(0);
 
 /* Counts how often a record file re-renders its page cache. Repeated small
@@ -140,6 +143,109 @@ static const struct proc_ops dnsfs_proc_record_refreshes_ops = {
 };
 
 static bool dnsfs_proc_record_refreshes;
+
+/* debugfs internals: one file per mount at <debugfs>/dnsfs/<zone>-<dev>, which
+ * dumps this mount's live config, module counters, in-flight query-queue depth,
+ * and the TTL cache as a text table. debugfs, not procfs, because this is a
+ * debugging aid that tracks the internals and carries no ABI promise; the
+ * format may change with the code. "watch -n1 cat <path>" makes it a live
+ * dashboard.
+ */
+static const char *dnsfs_qtype_name(u16 qtype)
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(dnsfs_types); i++)
+        if (dnsfs_types[i].qtype == qtype)
+            return dnsfs_types[i].name;
+    return "?";
+}
+
+static int dnsfs_debug_show(struct seq_file *m, void *v)
+{
+    struct super_block *sb = m->private;
+    struct dnsfs_config *cfg = sb->s_fs_info;
+    struct dnsfs_query_request *req;
+    struct dnsfs_cache_entry *entry;
+    unsigned int queued = 0, pending = 0;
+    unsigned long now = jiffies;
+
+    if (!cfg)
+        return 0;
+
+    seq_printf(m, "zone       %s\n", cfg->zone);
+    seq_printf(m, "nameserver %s  port %u  timeout %ums  retries %u\n",
+               cfg->nameserver ? cfg->nameserver : "(none)", cfg->port,
+               cfg->timeout_ms, cfg->retries);
+    seq_printf(m, "flags     %s%s%s%s\n", cfg->dnssec ? " dnssec" : "",
+               cfg->storage ? " storage" : "",
+               cfg->publisher_set ? " publisher" : "",
+               cfg->writable ? " writable" : "");
+    seq_printf(m, "counters   wire_queries %lld  refreshes %lld\n",
+               atomic64_read(&dnsfs_wire_queries),
+               atomic64_read(&dnsfs_record_refreshes));
+
+    /* Queue depth reveals coalescing: many readers, few pending wire queries.
+     */
+    spin_lock(&cfg->query_queue_lock);
+    list_for_each_entry (req, &cfg->query_queue, queue)
+        queued++;
+    list_for_each_entry (req, &cfg->query_pending, pending)
+        pending++;
+    spin_unlock(&cfg->query_queue_lock);
+    seq_printf(m, "in-flight  %u queued, %u pending\n\n", queued, pending);
+
+    seq_printf(m, "%-40s %-6s %-10s %8s %6s %5s\n", "FQDN", "TYPE", "STATE",
+               "TTL", "GEN", "LEN");
+
+    /* The LRU list holds every entry; query_lock is the cache write side, and
+     * seq_file runs in process context, so it is safe to hold across the walk.
+     */
+    mutex_lock(&cfg->query_lock);
+    list_for_each_entry (entry, &cfg->cache, list) {
+        long ttl = (long) (entry->expiry - now) / HZ;
+        const char *state = entry->err                          ? "negative"
+                            : entry->refreshing                 ? "refreshing"
+                            : time_after_eq(now, entry->expiry) ? "expired"
+                                                                : "valid";
+
+        seq_printf(m, "%-40s %-6s %-10s %8ld %6lu %5zu\n", entry->key.name,
+                   dnsfs_qtype_name(entry->key.qtype), state, ttl,
+                   entry->generation, entry->len);
+    }
+    seq_printf(m, "\ncache_entries %u\n", cfg->cache_entries);
+    mutex_unlock(&cfg->query_lock);
+
+    return 0;
+}
+
+/* Pre-size the seq buffer to the whole snapshot up front. dnsfs_debug_show
+ * walks the cache under query_lock, and plain single_open starts at one page
+ * and re-runs show() from scratch -- re-taking the lock -- every time the
+ * buffer overflows. One row is well under 128 bytes, so cache_entries * 128 (a
+ * lock-free hint; racy is fine, seq still grows if it undershoots) makes the
+ * common case a single walk. Cap the estimate so a huge cache can't demand a
+ * giant contiguous kvmalloc.
+ */
+static int dnsfs_debug_open(struct inode *inode, struct file *file)
+{
+    struct super_block *sb = inode->i_private;
+    struct dnsfs_config *cfg = sb->s_fs_info;
+    size_t size = PAGE_SIZE;
+
+    if (cfg)
+        size += min_t(size_t, (size_t) READ_ONCE(cfg->cache_entries) * 128,
+                      1u << 20);
+    return single_open_size(file, dnsfs_debug_show, sb, size);
+}
+
+static const struct file_operations dnsfs_debug_fops = {
+    .owner = THIS_MODULE,
+    .open = dnsfs_debug_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
 
 static bool dnsfs_is_lower_label(const struct qstr *name)
 {
@@ -544,9 +650,9 @@ static void dnsfs_storage_apply_inode_meta(struct inode *inode,
     inode->i_mode = S_IFREG | (meta->mode & 0777);
     if (cfg->writable)
         inode->i_mode |= 0200;
-    /* Lockless i_size store, same call as dnsfs_record_refresh (TODO B5): a
-     * plain aligned store on the 64-bit target. A 32-bit SMP target would need
-     * inode_lock here and around the matching i_size_read in the read path.
+    /* Lockless i_size store, same call as dnsfs_record_refresh: a plain aligned
+     * store on the 64-bit target. A 32-bit SMP target would need inode_lock
+     * here and around the matching i_size_read in the read path.
      */
     i_size_write(inode, meta->size);
     inode_set_mtime_to_ts(inode, (struct timespec64) {.tv_sec = meta->mtime});
@@ -763,8 +869,8 @@ static int dnsfs_storage_read_range_once(struct file *file,
 
     /* A read covering the whole file also gets a whole-file CRC check; pull the
      * decoded bytes into one buffer so dnsfs_crc32c_verify can validate them.
-     * This second buffer (TODO B6) is bounded by DNSFS_MAX_STORAGE_SIZE, capped
-     * in dnsfs_storage_validate_meta, so it can never exceed that ceiling.
+     * This second buffer is bounded by DNSFS_MAX_STORAGE_SIZE, capped in
+     * dnsfs_storage_validate_meta, so it can never exceed that ceiling.
      */
     verify_full = (start == 0 && out_len >= meta->size);
 
@@ -1086,9 +1192,9 @@ static int dnsfs_record_refresh(struct inode *inode, struct file *file)
     atomic64_inc(&dnsfs_record_refreshes);
     ret = dnsfs_record_fill(file, line);
     if (ret >= 0) {
-        /* Lockless i_size store (TODO B5): a plain aligned store on the 64-bit
-         * target. A 32-bit SMP target would need inode_lock here and around the
-         * matching i_size_read in the read path.
+        /* Lockless i_size store: a plain aligned store on the 64-bit target. A
+         * 32-bit SMP target would need inode_lock here and around the matching
+         * i_size_read in the read path.
          */
         i_size_write(inode, ret);
         invalidate_mapping_pages(inode->i_mapping, 0, -1);
@@ -1993,6 +2099,17 @@ static int dnsfs_fill_super(struct super_block *sb, struct fs_context *fc)
         goto err_shrinker;
     }
 
+    if (!IS_ERR_OR_NULL(dnsfs_debug_dir)) {
+        char name[DNSFS_MAX_NAME + 16];
+
+        /* MINOR(s_dev) is the anon-super id, so it is unique per mount and
+         * keeps two mounts of the same zone from colliding on one filename.
+         */
+        snprintf(name, sizeof(name), "%s-%u", cfg->zone, MINOR(sb->s_dev));
+        cfg->debug_file = debugfs_create_file(name, 0444, dnsfs_debug_dir, sb,
+                                              &dnsfs_debug_fops);
+    }
+
     fc->fs_private = NULL;
     return 0;
 
@@ -2133,6 +2250,13 @@ static void dnsfs_kill_sb(struct super_block *sb)
 {
     struct dnsfs_config *cfg = sb->s_fs_info;
 
+    /* Drain any active reader before the cfg it walks is torn down;
+     * debugfs_remove blocks until in-flight file ops finish, and no new open
+     * can find it after.
+     */
+    if (cfg)
+        debugfs_remove(cfg->debug_file);
+
     if (cfg && cfg->query_thread) {
         kthread_stop(cfg->query_thread);
         cfg->query_thread = NULL;
@@ -2165,8 +2289,11 @@ static int __init dnsfs_init(void)
             !!proc_create("record_refreshes", 0444, dnsfs_proc_dir,
                           &dnsfs_proc_record_refreshes_ops);
     }
+    dnsfs_debug_dir = debugfs_create_dir("dnsfs", NULL);
     ret = register_filesystem(&dnsfs_type);
     if (ret) {
+        debugfs_remove(dnsfs_debug_dir);
+        dnsfs_debug_dir = NULL;
         if (dnsfs_proc_wire_queries)
             remove_proc_entry("wire_queries", dnsfs_proc_dir);
         if (dnsfs_proc_record_refreshes)
@@ -2183,6 +2310,8 @@ static int __init dnsfs_init(void)
 static void __exit dnsfs_exit(void)
 {
     unregister_filesystem(&dnsfs_type);
+    debugfs_remove(dnsfs_debug_dir);
+    dnsfs_debug_dir = NULL;
     if (dnsfs_proc_wire_queries)
         remove_proc_entry("wire_queries", dnsfs_proc_dir);
     if (dnsfs_proc_record_refreshes)

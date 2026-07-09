@@ -101,6 +101,7 @@ struct dnsfs_config {
     struct socket *sock;       /* shared UDP socket, used only by the kthread */
     struct mutex query_lock;   /* serializes cache writes + sync wire queries */
     struct shrinker *shrinker; /* registers the cache with memory reclaim */
+    struct dentry *debug_file; /* debugfs internals dump for this mount */
 };
 
 /* One unit of work handed to the query kthread. Shared between the kthread and
