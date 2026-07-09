@@ -1,0 +1,13 @@
+# RFC 2136 dynamic-update target for the dnsfs publisher userhelper.
+#
+# This must point at an authoritative server for the zone, not a recursive
+# resolver like 1.1.1.1.
+zone=example.org.
+server=ns1.example.org
+
+# Optional TSIG key file for nsupdate -k.
+# key=/etc/bind/Kexample.org.+165+00000.key
+
+ttl=60
+state=/var/lib/dnsfs-nsupdate/state.txt
+nsupdate=nsupdate
